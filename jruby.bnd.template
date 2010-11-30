@@ -1,4 +1,4 @@
-Export-Package: org.jruby.*;version="@JRUBY_VERSION@"
+Export-Package: builtin.*;version="@JRUBY_VERSION@",org.jruby.*;version="@JRUBY_VERSION@"
 Import-Package: !org.jruby.*, *;resolution:=optional
 Bundle-Version: @JRUBY_VERSION@
 Bundle-Description: JRuby @JRUBY_VERSION@ OSGi bundle
