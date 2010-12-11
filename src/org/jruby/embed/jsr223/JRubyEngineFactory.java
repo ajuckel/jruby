@@ -59,6 +59,7 @@ public class JRubyEngineFactory implements ScriptEngineFactory {
     private final List<String> mimeTypes;
     private final List<String> engineIds;
     private Map<String, Object> parameters;
+    private ClassLoader classLoader;
 
     public JRubyEngineFactory() {
         engineName = "JSR 223 JRuby Engine";
@@ -174,9 +175,15 @@ public class JRubyEngineFactory implements ScriptEngineFactory {
         LocalVariableBehavior behavior = SystemPropertyCatcher.getBehavior(LocalVariableBehavior.GLOBAL);
         boolean lazy = SystemPropertyCatcher.isLazy(true);
         container = new ScriptingContainer(scope, behavior, lazy);
+        if( classLoader != null ) {
+            container.setClassLoader(classLoader);
+        }
         SystemPropertyCatcher.setConfiguration(container);
         JRubyEngine engine = new JRubyEngine(container, this);
         return (ScriptEngine)engine;
     }
 
+    public void setClassLoader(ClassLoader classLoader) {
+        this.classLoader = classLoader;
+    }
 }

@@ -1,7 +1,9 @@
 package org.jruby.javasupport;
 
+import org.jruby.Ruby;
 import org.jruby.anno.JRubyMethod;
 import org.jruby.anno.JRubyModule;
+import org.jruby.exceptions.RaiseException;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.Visibility;
 import org.jruby.runtime.builtin.IRubyObject;
@@ -41,16 +43,27 @@ public class JavaUtilities {
 
     @JRubyMethod(module = true, visibility = Visibility.PRIVATE)
     public static IRubyObject get_java_class(IRubyObject recv, IRubyObject arg0) {
-        return Java.get_java_class(recv, arg0);
+        return Java.get_java_class(recv, arg0, Java.wrapJavaObject(recv.getRuntime(), Ruby.getClassLoader()));
+    }
+
+    @JRubyMethod(module = true, visibility = Visibility.PRIVATE)
+    public static IRubyObject get_java_class(IRubyObject recv, IRubyObject arg0, IRubyObject arg1) {
+        return Java.get_java_class(recv, arg0, arg1);
     }
 
     @JRubyMethod(module = true, visibility = Visibility.PRIVATE)
     public static IRubyObject get_top_level_proxy_or_package(ThreadContext context, IRubyObject recv, IRubyObject arg0) {
-        return Java.get_top_level_proxy_or_package(context, recv, arg0);
+        return Java.get_top_level_proxy_or_package(context, recv, arg0, Ruby.getClassLoader());
     }
 
     @JRubyMethod(module = true, backtrace = true, visibility = Visibility.PRIVATE)
     public static IRubyObject get_proxy_or_package_under_package(ThreadContext context, IRubyObject recv, IRubyObject arg0, IRubyObject arg1) {
-        return Java.get_proxy_or_package_under_package(context, recv, arg0, arg1);
+        // TODO: Test then cast, rather than cast and handle.
+        try {
+            ClassLoader loader = (ClassLoader) arg1.toJava(ClassLoader.class);
+            return Java.get_top_level_proxy_or_package(context, recv, arg0, loader);
+        } catch(RaiseException error) {
+            return Java.get_proxy_or_package_under_package(context, recv, arg0, arg1);
+        }
     }
 }

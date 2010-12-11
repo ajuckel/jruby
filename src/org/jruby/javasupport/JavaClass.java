@@ -1030,8 +1030,12 @@ public class JavaClass extends JavaObject {
         PRIMITIVE_TO_CLASS.put("float", float.class);
         PRIMITIVE_TO_CLASS.put("double", double.class);
     }
-    
+
     public static synchronized JavaClass forNameVerbose(Ruby runtime, String className) {
+        return forNameVerbose(runtime, className, Ruby.getClassLoader());
+    }
+
+    public static synchronized JavaClass forNameVerbose(Ruby runtime, String className, ClassLoader classLoader) {
         Class <?> klass = null;
         if (className.indexOf(".") == -1 && Character.isLowerCase(className.charAt(0))) {
             // one word type name that starts lower-case...it may be a primitive type
@@ -1039,19 +1043,27 @@ public class JavaClass extends JavaObject {
         }
 
         if (klass == null) {
-            klass = runtime.getJavaSupport().loadJavaClassVerbose(className);
+            klass = runtime.getJavaSupport().loadJavaClassVerbose(className, classLoader);
         }
         return JavaClass.get(runtime, klass);
     }
     
     public static synchronized JavaClass forNameQuiet(Ruby runtime, String className) {
-        Class klass = runtime.getJavaSupport().loadJavaClassQuiet(className);
+        return forNameQuiet(runtime, className, Ruby.getClassLoader());
+    }
+
+    public static synchronized JavaClass forNameQuiet(Ruby runtime, String className, ClassLoader classLoader) {
+        Class klass = runtime.getJavaSupport().loadJavaClassQuiet(className, classLoader);
         return JavaClass.get(runtime, klass);
     }
 
     @JRubyMethod(name = "for_name", required = 1, meta = true)
     public static JavaClass for_name(IRubyObject recv, IRubyObject name) {
-        return forNameVerbose(recv.getRuntime(), name.asJavaString());
+        return forNameVerbose(recv.getRuntime(), name.asJavaString(), Ruby.getClassLoader());
+    }
+
+    public static JavaClass for_name(IRubyObject recv, IRubyObject name, IRubyObject classLoader) {
+        return forNameVerbose(recv.getRuntime(), name.asJavaString(), (ClassLoader) classLoader.toJava(ClassLoader.class));
     }
     
     private static final Callback __jsend_method = new Callback() {

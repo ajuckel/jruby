@@ -128,20 +128,20 @@ public class JavaSupport {
         this.active = active;
     }
     
-    private Class loadJavaClass(String className) throws ClassNotFoundException {
+    private Class loadJavaClass(String className, ClassLoader classLoader) throws ClassNotFoundException {
         Class primitiveClass;
         if ((primitiveClass = PRIMITIVE_CLASSES.get(className)) == null) {
             if (!Ruby.isSecurityRestricted()) {
-                return Class.forName(className, true, runtime.getJRubyClassLoader());
+                return Class.forName(className, true, runtime.getJRubyClassLoader(classLoader));
             }
             return Class.forName(className);
         }
         return primitiveClass;
     }
     
-    public Class loadJavaClassVerbose(String className) {
+    public Class loadJavaClassVerbose(String className, ClassLoader classLoader) {
         try {
-            return loadJavaClass(className);
+            return loadJavaClass(className, classLoader);
         } catch (ClassNotFoundException cnfExcptn) {
             throw runtime.newNameError("cannot load Java class " + className, className, cnfExcptn);
         } catch (ExceptionInInitializerError eiie) {
@@ -153,9 +153,9 @@ public class JavaSupport {
         }
     }
     
-    public Class loadJavaClassQuiet(String className) {
+    public Class loadJavaClassQuiet(String className, ClassLoader classLoader) {
         try {
-            return loadJavaClass(className);
+            return loadJavaClass(className, classLoader);
         } catch (ClassNotFoundException cnfExcptn) {
             throw runtime.newNameError("cannot load Java class " + className, className, cnfExcptn, false);
         } catch (ExceptionInInitializerError eiie) {

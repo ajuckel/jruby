@@ -1115,6 +1115,9 @@ public final class Ruby {
     }
 
     private void initRoot() {
+        jrubyClassLoaders = new HashMap<ClassLoader, JRubyClassLoader>();
+        jrubyClassLoaders.put(config.getLoader(), getJRubyClassLoader(config.getLoader()));
+
         boolean oneNine = is1_9();
         // Bootstrap the top of the hierarchy
         if (oneNine) {
@@ -2255,10 +2258,23 @@ public final class Ruby {
         return loader;
     }
 
+    private JRubyClassLoader basicGetJRubyClassLoader() {
+        return this.jrubyClassLoaders.get(config.getLoader());
+    }
+
     public synchronized JRubyClassLoader getJRubyClassLoader() {
+        return this.getJRubyClassLoader(config.getLoader());
+    }
+
+    public synchronized JRubyClassLoader getJRubyClassLoader(ClassLoader classLoader) {
         // FIXME: Get rid of laziness and handle restricted access elsewhere
-        if (!Ruby.isSecurityRestricted() && jrubyClassLoader == null) {
-            jrubyClassLoader = new JRubyClassLoader(config.getLoader());
+        JRubyClassLoader jrubyClassLoader = null;
+        if (!Ruby.isSecurityRestricted()) {
+            jrubyClassLoader = jrubyClassLoaders.get(classLoader);
+            if( jrubyClassLoader == null ) {
+                jrubyClassLoader = new JRubyClassLoader(classLoader);
+                jrubyClassLoaders.put(classLoader, jrubyClassLoader);
+            }
         }
         
         return jrubyClassLoader;
@@ -2620,7 +2636,7 @@ public final class Ruby {
                 // FIXME: duplicated from ClassCache
                 Class contents;
                 try {
-                    contents = jrubyClassLoader.loadClass(className);
+                    contents = basicGetJRubyClassLoader().loadClass(className);
                     if (RubyInstanceConfig.JIT_LOADING_DEBUG) {
                         System.err.println("found jitted code for " + filename + " at class: " + className);
                     }
@@ -2647,7 +2663,7 @@ public final class Ruby {
             if (script == null) {
                 Node scriptNode = parseFile(readStream, filename, null);
 
-                script = tryCompile(scriptNode, className, new JRubyClassLoader(jrubyClassLoader), false);
+                script = tryCompile(scriptNode, className, basicGetJRubyClassLoader(), false);
             }
             
             if (script == null) {
@@ -3965,7 +3981,7 @@ public final class Ruby {
 
     // Java support
     private JavaSupport javaSupport;
-    private JRubyClassLoader jrubyClassLoader;
+    private Map<ClassLoader, JRubyClassLoader> jrubyClassLoaders;
     
     // Management/monitoring
     private BeanManager beanManager;

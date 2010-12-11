@@ -568,7 +568,7 @@ public class LoadService {
                 }
 
                 // quietly try to load the class
-                Class theClass = runtime.getJavaSupport().loadJavaClassQuiet(className);
+                Class theClass = runtime.getJavaSupport().loadJavaClassQuiet(className, Ruby.getClassLoader());
                 state.library = new ClassExtensionLibrary(theClass);
             } catch (Exception ee) {
                 state.library = null;

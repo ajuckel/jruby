@@ -329,9 +329,9 @@ public class Java implements Library {
         return ((RubyModule) module).setConstantQuiet(constant.asJavaString(), get_proxy_class(recv, javaClass));
     }
 
-    public static IRubyObject get_java_class(IRubyObject recv, IRubyObject name) {
+    public static IRubyObject get_java_class(IRubyObject recv, IRubyObject name, IRubyObject classLoader) {
         try {
-            return JavaClass.for_name(recv, name);
+            return JavaClass.for_name(recv, name, classLoader);
         } catch (Exception e) {
             recv.getRuntime().getJavaSupport().handleNativeException(e, null);
             return recv.getRuntime().getNil();
@@ -924,7 +924,7 @@ public class Java implements Library {
         return runtime.getNil();
     }
 
-    private static RubyModule getTopLevelProxyOrPackage(ThreadContext context, final Ruby runtime, String sym) {
+    private static RubyModule getTopLevelProxyOrPackage(ThreadContext context, final Ruby runtime, String sym, ClassLoader classLoader) {
         final String name = sym.trim().intern();
         if (name.length() == 0) {
             throw runtime.newArgumentError("empty class or package name");
@@ -1006,9 +1006,9 @@ public class Java implements Library {
         });
     }
 
-    public static IRubyObject get_top_level_proxy_or_package(ThreadContext context, IRubyObject recv, IRubyObject sym) {
+    public static IRubyObject get_top_level_proxy_or_package(ThreadContext context, IRubyObject recv, IRubyObject sym, ClassLoader classLoader) {
         Ruby runtime = context.getRuntime();
-        RubyModule result = getTopLevelProxyOrPackage(context, runtime, sym.asJavaString());
+        RubyModule result = getTopLevelProxyOrPackage(context, runtime, sym.asJavaString(), classLoader);
 
         return result != null ? result : runtime.getNil();
     }
