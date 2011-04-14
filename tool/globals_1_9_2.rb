@@ -30,7 +30,6 @@ STDLIB_FILES = %w[
   mathn.rb
   matrix.rb
   minitest
-  mkmf.rb
   monitor.rb
   mutex_m.rb
   net
@@ -81,6 +80,8 @@ STDLIB_FILES = %w[
   webrick
   webrick.rb
   xmlrpc
+  yaml.rb
+  yaml
 ]
 
 EXT_FILES = {
@@ -90,17 +91,15 @@ EXT_FILES = {
   'ext/nkf/lib/kconv.rb' => 'kconv.rb',
   'ext/digest/lib/digest' => 'digest',
   'ext/digest/lib/digest.rb' => 'digest.rb',
-  'ext/digest/sha2/lib/sha2.rb' => 'sha2.rb',
+  'ext/digest/sha2/lib/sha2.rb' => 'digest/sha2.rb',
   'ext/dl/win32/lib/win32' => 'win32',
   'ext/psych/lib/psych.rb' => 'psych.rb',
   'ext/psych/lib/psych' => 'psych',
   'ext/ripper/lib/ripper.rb' => 'ripper.rb',
-  'ext/ripper/lib/ripper' => 'ripper'
+  'ext/ripper/lib/ripper' => 'ripper',
+  'ext/syck/lib/syck.rb' => 'syck.rb',
+  'ext/syck/lib/syck' => 'syck',
+  'ext/syck/lib/yaml' => 'yaml',
+  'ext/fiddle/lib/fiddle.rb' => 'fiddle.rb',
+  'ext/fiddle/lib/fiddle' => 'fiddle'
 }
-
-# yaml files go into src/builtin for jruby
-# disabled; need to reconcile 1.8 and 1.9 yaml
-#YAML_FILES = %w[
-#  yaml.rb
-#  yaml
-#]

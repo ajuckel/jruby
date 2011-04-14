@@ -14,8 +14,6 @@ import org.jruby.ext.posix.util.Platform;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
 
-import static java.io.File.*;
-
 public class ShellLauncherTest extends TestCase {
 
     private Ruby runtime;
@@ -111,7 +109,10 @@ public class ShellLauncherTest extends TestCase {
         RubyString path = runtime.newString("PATH");
         RubyString utilPath = runtime.newString(System.getProperty("jruby.home") + "/test/org/jruby/util");
         ThreadContext context = runtime.getCurrentContext();
-        env.op_aset(context, path, env.op_aref(context, path).convertToString().concat(runtime.newString(File.pathSeparator)).concat(utilPath));
+        env.op_aset(context, path, 
+                env.op_aref(context, path).convertToString()
+                .op_plus(context, runtime.newString(File.pathSeparator)).convertToString()
+                .op_plus(context, utilPath));
 
         String cmd = "shell_launcher_test";
         if (Platform.IS_WINDOWS) {

@@ -80,6 +80,14 @@ public class SingletonLocalContextProvider extends AbstractLocalContextProvider 
     }
 
     public boolean isRuntimeInitialized() {
+        if (localContext == null) {
+            localContext = getInstance();
+        }
         return localContext.initialized;
+    }
+    
+    public void terminate() {
+        localContext.remove();
+        localContext = null;
     }
 }

@@ -8,7 +8,7 @@ import org.jruby.runtime.BlockBody;
 import org.jruby.runtime.builtin.IRubyObject;
 
 public class ClosureMetaObject extends MetaObject {
-    public ClosureMetaObject(IRClosure scope) {
+    protected ClosureMetaObject(IRClosure scope) {
         super(scope);
     }
 
@@ -20,6 +20,7 @@ public class ClosureMetaObject extends MetaObject {
     @Override
     public Object retrieve(InterpreterContext interp) {
         BlockBody body = ((IRClosure) scope).getBlockBody();
+        scope.getStaticScope().determineModule();
         Binding binding = interp.getContext().currentBinding((IRubyObject) interp.getSelf(), interp.getSharedBindingScope());
 
         return new Block(body, binding);

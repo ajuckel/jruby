@@ -40,19 +40,19 @@ import org.jruby.anno.JRubyModule;
 import org.jruby.common.IRubyWarnings.ID;
 
 import org.jruby.exceptions.JumpException;
-import org.jruby.internal.runtime.methods.DynamicMethod;
 import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.Arity;
 import org.jruby.runtime.Block;
-import org.jruby.runtime.BlockBody;
 import org.jruby.runtime.CallBlock;
 import org.jruby.runtime.BlockCallback;
 import org.jruby.runtime.CallBlock19;
-import org.jruby.runtime.ClassIndex;
-import org.jruby.runtime.MethodIndex;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.util.TypeConverter;
+
+import static org.jruby.javasupport.util.RuntimeHelpers.invokedynamic;
+import static org.jruby.runtime.MethodIndex.OP_EQUAL;
+import static org.jruby.runtime.MethodIndex.OP_CMP;
 
 /**
  * The implementation of Ruby's Enumerable module.
@@ -82,6 +82,7 @@ public class RubyEnumerable {
                 Arity.OPTIONAL, callback, context));
     }
 
+    @Deprecated
     public static IRubyObject callEach(Ruby runtime, ThreadContext context, IRubyObject self, IRubyObject[] args,
             BlockCallback callback) {
         return RuntimeHelpers.invoke(context, self, "each", args, CallBlock.newCallClosure(self, runtime.getEnumerable(), Arity.OPTIONAL, callback, context));
@@ -99,6 +100,7 @@ public class RubyEnumerable {
                 arity, callback, context));
     }
 
+    @Deprecated
     public static IRubyObject callEach(Ruby runtime, ThreadContext context, IRubyObject self, IRubyObject[] args,
             Arity arity, BlockCallback callback) {
         return RuntimeHelpers.invoke(context, self, "each", args, CallBlock.newCallClosure(self, runtime.getEnumerable(), arity, callback, context));
@@ -434,7 +436,7 @@ public class RubyEnumerable {
             
             Arrays.sort(valuesAndCriteria, new Comparator<IRubyObject[]>() {
                 public int compare(IRubyObject[] o1, IRubyObject[] o2) {
-                    return RubyFixnum.fix2int(o1[1].callMethod(localContext, "<=>", o2[1]));
+                    return RubyFixnum.fix2int(invokedynamic(localContext, o1[1], OP_CMP, o2[1]));
                 }
             });
             
@@ -460,7 +462,7 @@ public class RubyEnumerable {
             
             Collections.sort(valuesAndCriteria, new Comparator<IRubyObject[]>() {
                 public int compare(IRubyObject[] o1, IRubyObject[] o2) {
-                    return RubyFixnum.fix2int(o1[1].callMethod(localContext, "<=>", o2[1]));
+                    return RubyFixnum.fix2int(invokedynamic(localContext, o1[1], OP_CMP, o2[1]));
                 }
             });
 
@@ -994,7 +996,7 @@ public class RubyEnumerable {
                 public IRubyObject call(ThreadContext ctx, IRubyObject[] largs, Block blk) {
                     IRubyObject larg = checkArgs(runtime, largs);
                     synchronized (result) {
-                        if (result[0] == null || RubyComparable.cmpint(ctx, larg.callMethod(ctx, "<=>", result[0]), larg, result[0]) > 0) {
+                        if (result[0] == null || RubyComparable.cmpint(ctx, invokedynamic(ctx, larg, OP_CMP, result[0]), larg, result[0]) > 0) {
                             result[0] = larg;
                         }
                     }
@@ -1022,7 +1024,7 @@ public class RubyEnumerable {
                 checkContext(localContext, ctx, "max_by");
                 IRubyObject v = block.yield(ctx, larg);
 
-                if (memo == null || RubyComparable.cmpint(ctx, v.callMethod(ctx, "<=>", memo), v, memo) > 0) {
+                if (memo == null || RubyComparable.cmpint(ctx, invokedynamic(ctx, v, OP_CMP, memo), v, memo) > 0) {
                     memo = v;
                     result[0] = larg;
                 }
@@ -1055,7 +1057,7 @@ public class RubyEnumerable {
                 public IRubyObject call(ThreadContext ctx, IRubyObject[] largs, Block blk) {
                     IRubyObject larg = checkArgs(runtime, largs);
                     synchronized (result) {
-                        if (result[0] == null || RubyComparable.cmpint(ctx, larg.callMethod(ctx, "<=>", result[0]), larg, result[0]) < 0) {
+                        if (result[0] == null || RubyComparable.cmpint(ctx, invokedynamic(ctx, larg, OP_CMP, result[0]), larg, result[0]) < 0) {
                             result[0] = larg;
                         }
                     }
@@ -1083,7 +1085,7 @@ public class RubyEnumerable {
                 checkContext(localContext, ctx, "min_by");
                 IRubyObject v = block.yield(ctx, larg);
 
-                if (memo == null || RubyComparable.cmpint(ctx, v.callMethod(ctx, "<=>", memo), v, memo) < 0) {
+                if (memo == null || RubyComparable.cmpint(ctx, invokedynamic(ctx, v, OP_CMP, memo), v, memo) < 0) {
                     memo = v;
                     result[0] = larg;
                 }
@@ -1129,11 +1131,11 @@ public class RubyEnumerable {
                         if (result[0] == null) {
                             result[0] = result[1] = arg;
                         } else {
-                            if (RubyComparable.cmpint(ctx, arg.callMethod(ctx, "<=>", result[0]), arg, result[0]) < 0) {
+                            if (RubyComparable.cmpint(ctx, invokedynamic(ctx, arg, OP_CMP, result[0]), arg, result[0]) < 0) {
                                 result[0] = arg;
                             }
 
-                            if (RubyComparable.cmpint(ctx, arg.callMethod(ctx, "<=>", result[1]), arg, result[1]) > 0) {
+                            if (RubyComparable.cmpint(ctx, invokedynamic(ctx, arg, OP_CMP, result[1]), arg, result[1]) > 0) {
                                 result[1] = arg;
                             }
                         }
@@ -1168,11 +1170,11 @@ public class RubyEnumerable {
                     minMemo = maxMemo = v;
                     result[0] = result[1] = arg;
                 } else {
-                    if (RubyComparable.cmpint(ctx, v.callMethod(ctx, "<=>", minMemo), v, minMemo) < 0) {
+                    if (RubyComparable.cmpint(ctx, invokedynamic(ctx, v, OP_CMP, minMemo), v, minMemo) < 0) {
                         minMemo = v;
                         result[0] = arg;
                     }
-                    if (RubyComparable.cmpint(ctx, v.callMethod(ctx, "<=>", maxMemo), v, maxMemo) > 0) {
+                    if (RubyComparable.cmpint(ctx, invokedynamic(ctx, v, OP_CMP, maxMemo), v, maxMemo) > 0) {
                         maxMemo = v;
                         result[1] = arg;
                     }

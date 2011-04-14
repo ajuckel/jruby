@@ -1,10 +1,7 @@
-require 'zlib'
-require 'fileutils'
-
 require 'rubygems/remote_fetcher'
 require 'rubygems/user_interaction'
 require 'rubygems/errors'
-require 'rubygems/maven_gemify'
+require 'rubygems/text'
 
 ##
 # SpecFetcher handles metadata updates from remote gem repositories.
@@ -12,6 +9,13 @@ require 'rubygems/maven_gemify'
 class Gem::SpecFetcher
 
   include Gem::UserInteraction
+  include Gem::Text
+
+  FILES = {
+    :all        => 'specs',
+    :latest     => 'latest_specs',
+    :prerelease => 'prerelease_specs',
+  }
 
   ##
   # The SpecFetcher cache dir.
@@ -44,12 +48,20 @@ class Gem::SpecFetcher
   end
 
   def initialize
+    require 'fileutils'
+
     @dir = File.join Gem.user_home, '.gem', 'specs'
     @update_cache = File.stat(Gem.user_home).uid == Process.uid
 
     @specs = {}
     @latest_specs = {}
     @prerelease_specs = {}
+
+    @caches = {
+      :latest => @latest_specs,
+      :prerelease => @prerelease_specs,
+      :all => @specs
+    }
 
     @fetcher = Gem::RemoteFetcher.fetcher
   end
@@ -75,14 +87,6 @@ class Gem::SpecFetcher
     end
 
     return [ss, errors]
-
-  rescue Gem::RemoteFetcher::FetchError => e
-    raise unless warn_legacy e do
-      require 'rubygems/source_info_cache'
-
-      return [Gem::SourceInfoCache.search_with_source(dependency,
-                                                     matching_platform, all), nil]
-    end
   end
 
   def fetch(*args)
@@ -93,13 +97,7 @@ class Gem::SpecFetcher
     spec = spec - [nil, 'ruby', '']
     spec_file_name = "#{spec.join '-'}.gemspec"
 
-    # from rubygems/maven_gemify.rb
-    is_maven = Gem::Specification.maven_name? spec[0]
-    if is_maven
-      uri = URI.parse("http://maven/#{spec_file_name}")
-    else
-      uri = source_uri + "#{Gem::MARSHAL_SPEC_DIR}#{spec_file_name}"
-    end
+    uri = source_uri + "#{Gem::MARSHAL_SPEC_DIR}#{spec_file_name}"
 
     cache_dir = cache_dir uri
 
@@ -108,10 +106,11 @@ class Gem::SpecFetcher
     if File.exist? local_spec then
       spec = Gem.read_binary local_spec
     else
-      if is_maven
+      spec = if maven_spec?(spec[0], source_uri)
         # from rubygems/maven_gemify.rb
-        spec = gemify_generate_spec(spec)
-      else
+        maven_generate_spec(spec)
+      end
+      unless spec
         uri.path << '.rz'
 
         spec = @fetcher.fetch_path uri
@@ -137,11 +136,6 @@ class Gem::SpecFetcher
   # is false, gems for all platforms are returned.
 
   def find_matching_with_errors(dependency, all = false, matching_platform = true, prerelease = false)
-    # from rubygems/maven_gemify.rb
-    if Gem::Specification.maven_name? dependency.name
-      return find_matching_using_maven(dependency)
-    end
-
     found = {}
 
     rejected_specs = {}
@@ -161,7 +155,7 @@ class Gem::SpecFetcher
     end
 
     errors = rejected_specs.values
-    
+
     specs_and_sources = []
 
     found.each do |source_uri, specs|
@@ -177,26 +171,31 @@ class Gem::SpecFetcher
   end
 
   ##
-  # Returns Array of gem repositories that were generated with RubyGems less
-  # than 1.2.
+  # Suggests a gem based on the supplied +gem_name+. Returns a string
+  # of the gem name if an approximate match can be found or nil
+  # otherwise. NOTE: for performance reasons only gems which exactly
+  # match the first character of +gem_name+ are considered.
 
-  def legacy_repos
-    Gem.sources.reject do |source_uri|
-      source_uri = URI.parse source_uri
-      spec_path = source_uri + "specs.#{Gem.marshal_version}.gz"
+  def suggest_gems_from_name gem_name
+    gem_name        = gem_name.downcase
+    max             = gem_name.size / 2
+    specs           = list.values.flatten 1
 
-      begin
-        @fetcher.fetch_size spec_path
-      rescue Gem::RemoteFetcher::FetchError
-        begin
-          @fetcher.fetch_size(source_uri + 'yaml') # re-raise if non-repo
-        rescue Gem::RemoteFetcher::FetchError
-          alert_error "#{source_uri} does not appear to be a repository"
-          raise
-        end
-        false
-      end
-    end
+    matches = specs.map { |name, version, platform|
+      next unless Gem::Platform.match platform
+
+      distance = levenshtein_distance gem_name, name.downcase
+
+      next if distance >= max
+
+      return [name] if distance == 0
+
+      [name, distance]
+    }.compact
+
+    matches = matches.uniq.sort_by { |name, dist| dist }
+
+    matches.first(5).map { |name, dist| name }
   end
 
   ##
@@ -214,15 +213,9 @@ class Gem::SpecFetcher
              :latest
            end
 
-    list = {}
-
-    file = { :latest => 'latest_specs',
-      :prerelease => 'prerelease_specs',
-      :all => 'specs' }[type]
-
-    cache = { :latest => @latest_specs,
-      :prerelease => @prerelease_specs,
-      :all => @specs }[type]
+    list  = {}
+    file  = FILES[type]
+    cache = @caches[type]
 
     Gem.sources.each do |source_uri|
       source_uri = URI.parse source_uri
@@ -288,29 +281,6 @@ class Gem::SpecFetcher
     end
 
     specs
-  end
-
-  ##
-  # Warn about legacy repositories if +exception+ indicates only legacy
-  # repositories are available, and yield to the block.  Returns false if the
-  # exception indicates some other FetchError.
-
-  def warn_legacy(exception)
-    uri = exception.uri.to_s
-    if uri =~ /specs\.#{Regexp.escape Gem.marshal_version}\.gz$/ then
-      alert_warning <<-EOF
-RubyGems 1.2+ index not found for:
-\t#{legacy_repos.join "\n\t"}
-
-RubyGems will revert to legacy indexes degrading performance.
-      EOF
-
-      yield
-
-      return true
-    end
-
-    false
   end
 
 end

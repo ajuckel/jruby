@@ -42,7 +42,6 @@ import java.io.IOException;
 import java.util.List;
 
 import org.jcodings.Encoding;
-import org.jruby.anno.FrameField;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
 import org.jruby.exceptions.JumpException;
@@ -67,6 +66,10 @@ import org.jruby.runtime.marshal.MarshalStream;
 import org.jruby.runtime.marshal.UnmarshalStream;
 import org.jruby.util.ByteList;
 import org.jruby.util.TypeConverter;
+
+import static org.jruby.javasupport.util.RuntimeHelpers.invokedynamic;
+import static org.jruby.runtime.MethodIndex.HASH;
+import static org.jruby.runtime.MethodIndex.OP_CMP;
 
 /**
  * @author jpetersen
@@ -206,7 +209,7 @@ public class RubyRange extends RubyObject {
     private void init(ThreadContext context, IRubyObject begin, IRubyObject end, boolean isExclusive) {
         if (!(begin instanceof RubyFixnum && end instanceof RubyFixnum)) {
             try {
-                IRubyObject result = begin.callMethod(context, "<=>", end);
+                IRubyObject result = invokedynamic(context, begin, OP_CMP, end);
                 if (result.isNil()) throw getRuntime().newArgumentError("bad value for range");
             } catch (RaiseException re) {
                 throw getRuntime().newArgumentError("bad value for range");
@@ -242,9 +245,9 @@ public class RubyRange extends RubyObject {
         long hash = isExclusive ? 1 : 0;
         long h = hash;
         
-        long v = begin.callMethod(context, "hash").convertToInteger().getLongValue();
+        long v = invokedynamic(context, begin, HASH).convertToInteger().getLongValue();
         hash ^= v << 1;
-        v = end.callMethod(context, "hash").convertToInteger().getLongValue();
+        v = invokedynamic(context, end, HASH).convertToInteger().getLongValue();
         hash ^= v << 9;
         hash ^= h << 24;
         return getRuntime().newFixnum(hash);
@@ -341,13 +344,13 @@ public class RubyRange extends RubyObject {
     }
 
     private IRubyObject rangeLt(ThreadContext context, IRubyObject a, IRubyObject b) {
-        IRubyObject result = a.callMethod(context, "<=>", b);
+        IRubyObject result = invokedynamic(context, a, OP_CMP, b);
         if (result.isNil()) return null;
         return RubyComparable.cmpint(context, result, a, b) < 0 ? getRuntime().getTrue() : null;
     }
 
     private IRubyObject rangeLe(ThreadContext context, IRubyObject a, IRubyObject b) {
-        IRubyObject result = a.callMethod(context, "<=>", b);
+        IRubyObject result = invokedynamic(context, a, OP_CMP, b);
         if (result.isNil()) return null;
         int c = RubyComparable.cmpint(context, result, a, b);
         if (c == 0) return RubyFixnum.zero(getRuntime());
@@ -629,7 +632,7 @@ public class RubyRange extends RubyObject {
         if (block.isGiven()) {
             return RuntimeHelpers.invokeSuper(context, this, block);
         } else {
-            int c = RubyComparable.cmpint(context, begin.callMethod(context, "<=>", end), begin, end);
+            int c = RubyComparable.cmpint(context, invokedynamic(context, begin, OP_CMP, end), begin, end);
             if (c > 0 || (c == 0 && isExclusive)) return context.getRuntime().getNil();
             return begin;
         }
@@ -643,7 +646,7 @@ public class RubyRange extends RubyObject {
         if (block.isGiven() || isExclusive && !(end instanceof RubyNumeric)) {
             return RuntimeHelpers.invokeSuper(context, this, block);
         } else {
-            int c = RubyComparable.cmpint(context, begin.callMethod(context, "<=>", end), begin, end);
+            int c = RubyComparable.cmpint(context, invokedynamic(context, begin, OP_CMP, end), begin, end);
             Ruby runtime = context.getRuntime();
             if (isExclusive) {
                 if (!(end instanceof RubyInteger)) throw runtime.newTypeError("cannot exclude non Integer end value");

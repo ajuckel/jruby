@@ -42,6 +42,8 @@ import org.jruby.anno.JRubyMethod;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.runtime.load.Library;
 
+import static org.jruby.util.URLUtil.getPath;
+
 /**
  * Utilities library for all those methods that don't need the full 'java' library
  * to be loaded. This is done mostly for performance reasons. For example, for those
@@ -73,7 +75,6 @@ public class JRubyUtilLibrary implements Library {
         return runtime.getNil();
     }
 
-    @SuppressWarnings(value = "deprecation")
     @JRubyMethod(name = "classloader_resources", module = true)
     public static IRubyObject getClassLoaderResources(IRubyObject recv, IRubyObject arg) {
         Ruby runtime = recv.getRuntime();
@@ -83,7 +84,7 @@ public class JRubyUtilLibrary implements Library {
             Enumeration<URL> urls = runtime.getJRubyClassLoader().getResources(resource);
             while (urls.hasMoreElements()) {
                 URL url = urls.nextElement();
-                String urlString = url.getPath();
+                String urlString = getPath(url);
                 urlStrings.add(runtime.newString(urlString));
             }
             return RubyArray.newArrayNoCopy(runtime, urlStrings.toArray(new IRubyObject[urlStrings.size()]));

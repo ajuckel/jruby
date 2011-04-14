@@ -56,13 +56,13 @@ import org.jruby.RubyString;
 import org.jruby.RubyStruct;
 import org.jruby.RubySymbol;
 import org.jruby.IncludedModuleWrapper;
-import org.jruby.RubyEncoding;
 import org.jruby.runtime.ClassIndex;
 import org.jruby.runtime.Constants;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.runtime.builtin.Variable;
 import org.jruby.util.ByteList;
 import org.jruby.internal.runtime.methods.DynamicMethod;
+import org.jruby.runtime.encoding.EncodingCapable;
 
 /**
  * Marshals objects into Ruby's binary marshal format.
@@ -74,6 +74,7 @@ public class MarshalStream extends FilterOutputStream {
     private final MarshalCache cache;
     private final int depthLimit;
     private boolean tainted = false;
+    private boolean untrusted = false;
     
     private int depth = 0;
 
@@ -81,7 +82,7 @@ public class MarshalStream extends FilterOutputStream {
     private final static char TYPE_USRMARSHAL = 'U';
     private final static char TYPE_USERDEF = 'u';
     private final static char TYPE_UCLASS = 'C';
-    private final static String SYMBOL_ENCODING_SPECIAL = "E";
+    public final static String SYMBOL_ENCODING_SPECIAL = "E";
     private final static String SYMBOL_ENCODING = "encoding";
 
     public MarshalStream(Ruby runtime, OutputStream out, int depthLimit) throws IOException {
@@ -101,10 +102,9 @@ public class MarshalStream extends FilterOutputStream {
         if (depth > depthLimit) {
             throw runtime.newArgumentError("exceed depth limit");
         }
-        
-        if(!tainted && value.isTaint()) {
-            tainted = true;
-        }
+
+        tainted |= value.isTaint();
+        untrusted |= value.isUntrusted();
 
         writeAndRegister(value);
 
@@ -161,7 +161,7 @@ public class MarshalStream extends FilterOutputStream {
         if (value instanceof CoreObjectType) {
             int nativeTypeIndex = ((CoreObjectType)value).getNativeTypeIndex();
             
-            if (nativeTypeIndex != ClassIndex.OBJECT) {
+            if (nativeTypeIndex != ClassIndex.OBJECT && nativeTypeIndex != ClassIndex.BASICOBJECT) {
                 if (shouldMarshalEncoding(value) || (
                         !value.isImmediate()
                         && value.hasVariables()
@@ -197,8 +197,8 @@ public class MarshalStream extends FilterOutputStream {
 
     private boolean shouldMarshalEncoding(IRubyObject value) {
         return runtime.is1_9()
-                && value.getMetaClass() == runtime.getString()
-                && ((RubyString)value).getEncoding() != ASCIIEncoding.INSTANCE;
+                && (value instanceof RubyString || value instanceof RubyRegexp)
+                && ((EncodingCapable)value).getEncoding() != ASCIIEncoding.INSTANCE;
     }
 
     public void writeDirectly(IRubyObject value) throws IOException {
@@ -295,6 +295,7 @@ public class MarshalStream extends FilterOutputStream {
                 write('0');
                 return;
             case ClassIndex.OBJECT:
+            case ClassIndex.BASICOBJECT:
                 dumpDefaultObjectHeader(value.getMetaClass());
                 value.getMetaClass().getRealClass().marshal(value, this);
                 return;
@@ -404,7 +405,7 @@ public class MarshalStream extends FilterOutputStream {
     public void dumpVariablesWithEncoding(List<Variable<Object>> vars, IRubyObject obj) throws IOException {
         if (shouldMarshalEncoding(obj)) {
             writeInt(vars.size() + 1); // vars preceded by encoding
-            writeEncoding(((RubyString)obj).getEncoding());
+            writeEncoding(((EncodingCapable)obj).getEncoding());
         } else {
             writeInt(vars.size());
         }
@@ -526,5 +527,9 @@ public class MarshalStream extends FilterOutputStream {
 
     public boolean isTainted() {
         return tainted;
+    }
+
+    public boolean isUntrusted() {
+        return untrusted;
     }
 }

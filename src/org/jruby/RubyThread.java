@@ -38,7 +38,6 @@ import java.nio.channels.Channel;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.spi.SelectorProvider;
 import java.util.WeakHashMap;
 import java.util.HashMap;
 import java.util.Map;
@@ -66,6 +65,7 @@ import org.jruby.runtime.ObjectMarshal;
 import static org.jruby.runtime.Visibility.*;
 import org.jruby.util.io.BlockingIO;
 import org.jruby.util.io.SelectorFactory;
+import static org.jruby.CompatVersion.*;
 
 /**
  * Implementation of Ruby's <code>Thread</code> class.  Each Ruby thread is
@@ -110,6 +110,7 @@ public class RubyThread extends RubyObject implements ExecutionContext {
         this.threadService = runtime.getThreadService();
         finalResult = runtime.getNil();
 
+        this.priority = RubyFixnum.newFixnum(runtime, Thread.NORM_PRIORITY);
         // init errorInfo to nil
         errorInfo = runtime.getNil();
     }
@@ -171,7 +172,11 @@ public class RubyThread extends RubyObject implements ExecutionContext {
     public ThreadContext getContext() {
         return contextRef.get();
     }
-    
+
+
+    public Thread getNativeThread() {
+        return threadImpl instanceof NativeThread ? ((NativeThread) threadImpl).getThread() : null;
+    }
     /**
      * Dispose of the current thread by removing it from its parent ThreadGroup.
      */
@@ -291,6 +296,11 @@ public class RubyThread extends RubyObject implements ExecutionContext {
             Thread.yield();
         
             return this;
+        } catch (OutOfMemoryError oome) {
+            if (oome.getMessage().equals("unable to create new native thread")) {
+                throw runtime.newThreadError(oome.getMessage());
+            }
+            throw oome;
         } catch (SecurityException ex) {
           throw runtime.newThreadError(ex.getMessage());
         }
@@ -314,7 +324,7 @@ public class RubyThread extends RubyObject implements ExecutionContext {
     }
 
     public synchronized void beDead() {
-        status = status.DEAD;
+        status = Status.DEAD;
     }
 
     public void pollThreadEvents() {
@@ -850,7 +860,7 @@ public class RubyThread extends RubyObject implements ExecutionContext {
         return this;
     }
     
-    @JRubyMethod(name = {"kill!", "exit!", "terminate!"})
+    @JRubyMethod(name = {"kill!", "exit!", "terminate!"}, compat = RUBY1_8)
     public IRubyObject kill_bang() {
         throw getRuntime().newNotImplementedError("Thread#kill!, exit!, and terminate! are not safe and not supported");
     }
@@ -862,7 +872,7 @@ public class RubyThread extends RubyObject implements ExecutionContext {
 
     @JRubyMethod(compat = CompatVersion.RUBY1_9)
     public IRubyObject backtrace(ThreadContext context) {
-        return context.createCallerBacktrace(context.getRuntime(), 0);
+        return getContext().createCallerBacktrace(context.getRuntime(), 0);
     }
 
     public StackTraceElement[] javaBacktrace() {
@@ -920,8 +930,16 @@ public class RubyThread extends RubyObject implements ExecutionContext {
     public boolean select(RubyIO io, int ops) {
         return select(io.getChannel(), io, ops);
     }
+    
+    public boolean select(RubyIO io, int ops, long timeout) {
+        return select(io.getChannel(), io, ops, timeout);
+    }
 
     public boolean select(Channel channel, RubyIO io, int ops) {
+        return select(channel, io, ops, -1);
+    }
+
+    public boolean select(Channel channel, RubyIO io, int ops, long timeout) {
         if (channel instanceof SelectableChannel) {
             SelectableChannel selectable = (SelectableChannel)channel;
             
@@ -938,7 +956,14 @@ public class RubyThread extends RubyObject implements ExecutionContext {
                     key = selectable.register(currentSelector, ops);
 
                     beforeBlockingCall();
-                    int result = currentSelector.select();
+                    int result;
+                    if (timeout < 0) {
+                        result = currentSelector.select();
+                    } else if (timeout == 0) {
+                        result = currentSelector.selectNow();
+                    } else {
+                        result = currentSelector.select(timeout);
+                    }
 
                     // check for thread events, in case we've been woken up to die
                     pollThreadEvents();
@@ -1060,7 +1085,7 @@ public class RubyThread extends RubyObject implements ExecutionContext {
 
     public boolean wait_timeout(IRubyObject o, Double timeout) throws InterruptedException {
         if ( timeout != null ) {
-            long delay_ns = (long)(timeout * 1000000000.0);
+            long delay_ns = (long)(timeout.doubleValue() * 1000000000.0);
             long start_ns = System.nanoTime();
             if (delay_ns > 0) {
                 long delay_ms = delay_ns / 1000000;

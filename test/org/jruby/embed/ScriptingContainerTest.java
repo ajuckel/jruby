@@ -29,6 +29,7 @@
  */
 package org.jruby.embed;
 
+import org.jruby.embed.internal.ConcurrentLocalContextProvider;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -200,6 +201,15 @@ public class ScriptingContainerTest {
         instance.setErrorWriter(writer);
         result = instance.getProvider();
         assertTrue(result instanceof SingletonLocalContextProvider);
+        instance = null;
+        
+        instance = new ScriptingContainer(LocalContextScope.CONCURRENT);
+        instance.setError(pstream);
+        instance.setOutput(pstream);
+        instance.setWriter(writer);
+        instance.setErrorWriter(writer);
+        result = instance.getProvider();
+        assertTrue(result instanceof ConcurrentLocalContextProvider);
         instance = null;
     }
 
@@ -1813,7 +1823,7 @@ public class ScriptingContainerTest {
     public void testSetCompatVersion() {
         logger1.info("setCompatVersion");
         CompatVersion version = null;
-        ScriptingContainer instance = new ScriptingContainer(LocalContextScope.THREADSAFE);
+        ScriptingContainer instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
         instance.setError(pstream);
         instance.setOutput(pstream);
         instance.setWriter(writer);
@@ -1821,6 +1831,9 @@ public class ScriptingContainerTest {
         instance.setCompatVersion(version);
         assertEquals(CompatVersion.RUBY1_8, instance.getCompatVersion());
 
+        // CompatVersion can't be changed after Ruby Runtime has been initialized, so
+        // need to have new Runtime for this test
+        instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
         version = CompatVersion.RUBY1_9;
         instance.setCompatVersion(version);
         assertEquals(version, instance.getCompatVersion());
@@ -1879,7 +1892,7 @@ public class ScriptingContainerTest {
         instance.setOutput(pstream);
         instance.setWriter(writer);
         instance.setErrorWriter(writer);
-        Map expResult = null;
+        Map expResult = System.getenv();
         Map result = instance.getEnvironment();
         assertEquals(expResult, result);
 
@@ -1899,7 +1912,7 @@ public class ScriptingContainerTest {
         instance.setWriter(writer);
         instance.setErrorWriter(writer);
         instance.setEnvironment(environment);
-        assertEquals(environment, instance.getEnvironment());
+        assertEquals(new HashMap(), instance.getEnvironment());
 
         environment = new HashMap();
         environment.put("abc", "def");
@@ -1947,7 +1960,26 @@ public class ScriptingContainerTest {
         instance.setCurrentDirectory(directory);
         assertEquals(directory, instance.getCurrentDirectory());
 
-        instance = null;
+        directory = System.getProperty( "user.home" );
+        instance = new ScriptingContainer();
+        instance.setCurrentDirectory(directory);
+        assertEquals(directory, instance.getCurrentDirectory());
+        
+        instance = new ScriptingContainer(LocalContextScope.CONCURRENT);
+        instance.setError(pstream);
+        instance.setOutput(pstream);
+        instance.setWriter(writer);
+        instance.setErrorWriter(writer);
+        instance.setCurrentDirectory(directory);
+        assertEquals(directory, instance.getCurrentDirectory());
+        
+        instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
+        instance.setError(pstream);
+        instance.setOutput(pstream);
+        instance.setWriter(writer);
+        instance.setErrorWriter(writer);
+        instance.setCurrentDirectory(directory);
+        assertEquals(directory, instance.getCurrentDirectory());
     }
 
     /**
@@ -2482,7 +2514,7 @@ public class ScriptingContainerTest {
         instance.setOutput(pstream);
         instance.setWriter(writer);
         instance.setErrorWriter(writer);
-        int expResult = 10000;
+        int expResult = 30000;
         int result = instance.getJitMaxSize();
         assertEquals(expResult, result);
 
@@ -2638,11 +2670,11 @@ public class ScriptingContainerTest {
 
 
     /**
-     * Test of clear method, of class ScriptingContainer.
+     * Test of Thread.currentThread().setContextClassLoader method
      */
     @Test
     public void testNullToContextClassLoader() {
-        logger1.info("clear");
+        logger1.info("Thread.currentThread().setContextClassLoader(null)");
         ScriptingContainer instance = null;
         try {
             ClassLoader oldClassLoader = Thread.currentThread().getContextClassLoader();
@@ -2654,5 +2686,38 @@ public class ScriptingContainerTest {
         } finally {
             instance = null;
         }
+    }
+    
+    /**
+     * Test of setClassLoader method, of SystemPropertyCatcher.
+     * This method is only used in JSR223 but tested here. Since, JSR223
+     * is not easy to test internal state.
+     */
+    @Test
+    public void testSystemPropertyCatcherSetClassloader() {
+        logger1.info("SystemPropertyCatcher.setClassloader");
+        System.setProperty(PropertyName.CLASSLOADER.toString(), "container");
+        ScriptingContainer instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
+        org.jruby.embed.util.SystemPropertyCatcher.setClassLoader(instance);
+        assertEquals(instance.getClass().getClassLoader(), instance.getClassLoader());
+        
+        System.setProperty(PropertyName.CLASSLOADER.toString(), "context");
+        instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
+        org.jruby.embed.util.SystemPropertyCatcher.setClassLoader(instance);
+        assertEquals(Thread.currentThread().getContextClassLoader(), instance.getClassLoader());
+    }
+    
+    /**
+     * Test of setClassLoader method, of SystemPropertyCatcher.
+     * This method is only used in JSR223 but tested here. Since, JSR223
+     * is not easy to test internal state.
+     */
+    @Test
+    public void testScopeInCallMethod() {
+        logger1.info("Scope in callMethod should not be null");
+        ScriptingContainer instance = new ScriptingContainer(LocalContextScope.SINGLETHREAD);
+        Object someInstance = instance.runScriptlet("Object.new");
+        Object result = instance.callMethod(someInstance, "instance_eval", "self", "<eval>", 1);
+        assertNotNull(result);
     }
 }

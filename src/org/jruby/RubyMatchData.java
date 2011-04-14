@@ -189,6 +189,16 @@ public class RubyMatchData extends RubyObject {
     private void checkLazyRegexp() {
         if (regexp == null) regexp = RubyRegexp.newRegexp(getRuntime(), (ByteList)pattern.getUserObject(), pattern);
     }
+    
+    // FIXME: We should have a better way of using the proper method based
+    // on version as a general solution...
+    private RubyString makeShared(Ruby runtime, RubyString str, int begin, int length) {
+        if (runtime.is1_9()) {
+            return str.makeShared19(runtime, begin, length);
+        } else {
+            return str.makeShared(runtime, begin, length);
+        }
+    }
 
     private RubyArray match_array(Ruby runtime, int start) {
         check();
@@ -197,7 +207,7 @@ public class RubyMatchData extends RubyObject {
             if (begin == -1) {
                 return runtime.newArray(runtime.getNil());
             } else {
-                RubyString ss = str.makeShared(runtime, begin, end - begin);
+                RubyString ss = makeShared(runtime, str, begin, end - begin);
                 if (isTaint()) ss.setTaint(true);
                 return runtime.newArray(ss);
             }
@@ -207,7 +217,7 @@ public class RubyMatchData extends RubyObject {
                 if (regs.beg[i] == -1) {
                     arr.append(runtime.getNil());
                 } else {
-                    RubyString ss = str.makeShared(runtime, regs.beg[i], regs.end[i] - regs.beg[i]);
+                    RubyString ss = makeShared(runtime, str, regs.beg[i], regs.end[i] - regs.beg[i]);                   
                     if (isTaint()) ss.setTaint(true); 
                     arr.append(ss);
                 }
@@ -223,6 +233,25 @@ public class RubyMatchData extends RubyObject {
 
     public IRubyObject group(int n) {
         return RubyRegexp.nth_match(n, this);
+    }
+
+    // This returns a list of values in the order the names are defined (named capture local var
+    // feature uses this).
+    public IRubyObject[] getNamedBackrefValues(Ruby runtime) {
+        if (pattern.numberOfNames() == 0) return NULL_ARRAY;
+
+        IRubyObject[] values = new IRubyObject[pattern.numberOfNames()];
+
+        int j = 0;
+        for (Iterator<NameEntry> i = pattern.namedBackrefIterator(); i.hasNext();) {
+            NameEntry e = i.next();
+            int[] refs = e.getBackRefs();
+            int length = refs.length;
+
+            values[j++] = length == 0 ? runtime.getNil() : RubyRegexp.nth_match(refs[length - 1], this);
+        }
+
+        return values;
     }
 
     @JRubyMethod(name = "inspect")
@@ -525,7 +554,7 @@ public class RubyMatchData extends RubyObject {
     public IRubyObject pre_match(ThreadContext context) {
         check();
         if (begin == -1) return context.getRuntime().getNil();
-        return str.makeShared(context.getRuntime(), 0, begin).infectBy(this);
+        return makeShared(context.getRuntime(), str, 0, begin).infectBy(this);
     }
 
     /** match_post_match
@@ -535,7 +564,7 @@ public class RubyMatchData extends RubyObject {
     public IRubyObject post_match(ThreadContext context) {
         check();
         if (begin == -1) return context.getRuntime().getNil();
-        return str.makeShared(context.getRuntime(), end, str.getByteList().length() - end).infectBy(this);
+        return makeShared(context.getRuntime(), str, end, str.getByteList().length() - end).infectBy(this);
     }
 
     /** match_to_s

@@ -1,5 +1,6 @@
 package org.jruby.compiler.ir.instructions;
 
+import java.util.Map;
 import org.jruby.compiler.ir.Interp;
 import org.jruby.compiler.ir.Operation;
 import org.jruby.compiler.ir.operands.Label;
@@ -9,44 +10,42 @@ import org.jruby.compiler.ir.representations.InlinerInfo;
 import org.jruby.interpreter.InterpreterContext;
 import org.jruby.runtime.builtin.IRubyObject;
 
-public class YieldInstr extends MultiOperandInstr {
+public class YieldInstr extends Instr {
     // SSS FIXME: Correct?  Where does closure arg come from?
-    public YieldInstr(Variable result, Operand[] args) {
-        super(Operation.YIELD, result, args);
+    Operand yieldArg;
+    public YieldInstr(Variable result, Operand arg) {
+        super(Operation.YIELD, result);
+        this.yieldArg = arg;
     }
    
-    public boolean isRubyInternalsCall() {
-        return false;
-    }
-
-    public boolean isStaticCallTarget() {
-        return false;
-    }
-
     public Instr cloneForInlining(InlinerInfo ii) {
+        // FIXME: This needs to be cloned!
         return this;  // This is just a placeholder during inlining.
     }
 
     @Interp
     @Override
     public Label interpret(InterpreterContext interp, IRubyObject self) {
-        Object resultValue = interp.getBlock().call(interp.getContext(), prepareArguments(interp));
-
+        Object resultValue;
+        if (yieldArg == null) {
+            resultValue = interp.getBlock().call(interp.getContext());
+        } else {
+            resultValue = interp.getBlock().yield(interp.getContext(), (IRubyObject)yieldArg.retrieve(interp));
+        }
         getResult().store(interp, resultValue);
         return null;
     }
 
-    public IRubyObject[] prepareArguments(InterpreterContext interp) {
-        Operand[] operands = getOperands();
-        IRubyObject[] args = new IRubyObject[operands.length];
-        int length = args.length;
+    @Override
+    public String toString() { 
+        return super.toString() + "(" + yieldArg + ")";
+    }
 
-        for (int i = 0; i < length; i++) {
-            args[i] = (IRubyObject) operands[i].retrieve(interp);
-        }
+    public Operand[] getOperands() {
+        return (yieldArg == null) ? new Operand[]{} : new Operand[] {yieldArg};
+    }
 
-        //System.out.println("ARGS>LENGTH " + args.length);
-        //System.out.println("ARGS: " + java.util.Arrays.toString(args));
-        return args;
+    public void simplifyOperands(Map<Operand, Operand> valueMap) {
+        if (yieldArg != null) yieldArg = yieldArg.getSimplifiedOperand(valueMap);
     }
 }

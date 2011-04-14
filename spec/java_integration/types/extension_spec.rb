@@ -10,6 +10,7 @@ import "java_integration.fixtures.PrivateStaticMethod"
 import "java_integration.fixtures.ConcreteWithVirtualCall"
 import "java_integration.fixtures.ComplexPrivateConstructor"
 import "java_integration.fixtures.ReceivesArrayList"
+import "java_integration.fixtures.ClassWithAbstractMethods"
 
 describe "A Ruby subclass of a Java concrete class" do
   it "should allow access to the proxy object for the class" do
@@ -128,6 +129,45 @@ describe "A Ruby subclass of a Java concrete class" do
     end.should_not raise_error
     my_arraylist.class.superclass.should == java.util.ArrayList
     my_arraylist.to_java.should == my_arraylist
+  end
+  
+  it "raises argument error when super does not match superclass constructor arity" do
+    my_arraylist_cls = Class.new(java.util.ArrayList) do
+      def initialize
+        super('foo', 'foo', 'foo')
+      end
+    end
+    
+    proc do
+      my_arraylist_cls.new
+    end.should raise_error(ArgumentError)
+  end
+  
+  # JRUBY-4788
+  it "raises argument error if no matching arity method has been implemented on class or superclass" do
+    my_cwam_cls = Class.new(ClassWithAbstractMethods) do
+      # arity should be 1, mismatch is intentional
+      def foo1
+        "ok"
+      end
+    end
+    my_cwam = my_cwam_cls.new
+    
+    proc do
+      ClassWithAbstractMethods.callFoo1(my_cwam, "ok")
+    end.should raise_error(ArgumentError)
+  end
+  
+  it "dispatches to other-arity superclass methods if arities mismatch" do
+    my_cwam_cls = Class.new(ClassWithAbstractMethods) do
+      # arity should be 2, mismatch is intentional
+      def foo2(arg)
+        "bad"
+      end
+    end
+    my_cwam = my_cwam_cls.new
+    
+    ClassWithAbstractMethods.callFoo2(my_cwam, "x", "y").should == "ok"
   end
 end
 

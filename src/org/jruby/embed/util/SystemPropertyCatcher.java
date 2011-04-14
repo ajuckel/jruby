@@ -12,7 +12,7 @@
  * implied. See the License for the specific language governing
  * rights and limitations under the License.
  *
- * Copyright (C) 2009 Yoko Harada <yokolet@gmail.com>
+ * Copyright (C) 2009-2011 Yoko Harada <yokolet@gmail.com>
  *
  * Alternatively, the contents of this file may be used under the terms of
  * either of the GNU General Public License Version 2 or later (the "GPL"),
@@ -30,10 +30,11 @@
 package org.jruby.embed.util;
 
 import java.io.File;
+import java.io.UnsupportedEncodingException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import org.jruby.embed.PropertyName;
 import java.util.regex.Matcher;
@@ -45,6 +46,8 @@ import org.jruby.embed.internal.LocalContextProvider;
 import org.jruby.embed.LocalContextScope;
 import org.jruby.embed.LocalVariableBehavior;
 import org.jruby.embed.ScriptingContainer;
+
+import static org.jruby.util.URLUtil.getPath;
 
 /**
  * Utility methods to retrieve System properties or environment variables to
@@ -106,7 +109,7 @@ public class SystemPropertyCatcher {
      * Gets a local variable behavior from System property. If no value is assigned to
      * PropertyName.LOCALVARIABLE_BEHAVIOR, given default value is applied.
      *
-     * @param defaultBehavior a default local variable behavior
+     * @param defaultLaziness a default local variable behavior
      * @return a local variable behavior
      */
     public static boolean isLazy(boolean defaultLaziness) {
@@ -116,6 +119,30 @@ public class SystemPropertyCatcher {
             return lazy;
         }
         return Boolean.parseBoolean(s);
+    }
+    
+    /**
+     * Sets classloader based on System property. This is only used from
+     * JRubyEgnineFactory.
+     * 
+     * @param container ScriptingContainer to be set classloader
+     */
+    
+    public static void setClassLoader(ScriptingContainer container) {
+        String s = System.getProperty(PropertyName.CLASSLOADER.toString());
+        
+        // current should be removed later
+        if (s == null || "container".equals(s) || "current".equals(s)) { // default
+            container.setClassLoader(container.getClass().getClassLoader());
+            return;
+        } else if ("context".equals(s)) {
+            container.setClassLoader(Thread.currentThread().getContextClassLoader());
+            return;
+        } else if ("none".equals(s)) {
+            return;
+        }
+        // if incorrect value is set, no classloader will set by ScriptingContainer.
+        // allows RubyInstanceConfig to set whatever preferable
     }
 
     /**
@@ -150,10 +177,9 @@ public class SystemPropertyCatcher {
      * jruby.home system property, or jury.home in jruby-complete.jar
      *
      * @param container ScriptingContainer to be set jruby home.
-     * @throws URISyntaxException exceptions thrown while inspecting jruby-complete.jar
      */
     @Deprecated
-    public static void setJRubyHome(ScriptingContainer container) throws URISyntaxException {
+    public static void setJRubyHome(ScriptingContainer container) {
         String jrubyhome = findJRubyHome(container);
         if (jrubyhome != null) {
             container.getProvider().getRubyInstanceConfig().setJRubyHome(jrubyhome);
@@ -166,10 +192,9 @@ public class SystemPropertyCatcher {
      * is used.
      *
      * @param instance any instance to get a resource
-     * @return JRuby home path if exists, null when failed to fint it.
-     * @throws URISyntaxException
+     * @return JRuby home path if exists, null when failed to find it.
      */
-    public static String findJRubyHome(Object instance) throws URISyntaxException {
+    public static String findJRubyHome(Object instance) {
         String jrubyhome;
         if ((jrubyhome = System.getenv("JRUBY_HOME")) != null) {
             return jrubyhome;
@@ -182,7 +207,7 @@ public class SystemPropertyCatcher {
         }
     }
 
-    private static String findFromJar(Object instance) throws URISyntaxException {
+    public static String findFromJar(Object instance) {
         URL resource = instance.getClass().getResource("/META-INF/jruby.home");
         if (resource == null) {
             return null;
@@ -190,10 +215,20 @@ public class SystemPropertyCatcher {
 
         String location = null;
         if (resource.getProtocol().equals("jar")) {
-            location = resource.getPath();
+            location = getPath(resource);
+            if (!location.startsWith("file:")) {
+                // for remote-sourced classpath resources, just use classpath:
+                location = "classpath:/META-INF/jruby.home";
+            }
         } else {
             location = "classpath:/META-INF/jruby.home";
         }
+
+        // Trim trailing slash. It confuses OSGi containers...
+        if (location.endsWith("/")) {
+            location = location.substring(0, location.length() - 1);
+        }
+
         return location;
     }
 
@@ -236,8 +271,9 @@ public class SystemPropertyCatcher {
      *         returns false.
      */
     public static boolean isRuby19(String name) {
-        Pattern p = Pattern.compile("[jJ]?(r|R)(u|U)(b|B)(y|Y)1[\\._]?9");
-        Matcher m = p.matcher(name);
+        String n = name.toLowerCase();
+        Pattern p = Pattern.compile("j?ruby1[\\._]?9");
+        Matcher m = p.matcher(n);
         if (m.matches()) {
             return true;
         } else {

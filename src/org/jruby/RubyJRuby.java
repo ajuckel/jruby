@@ -30,6 +30,7 @@
  ***** END LICENSE BLOCK *****/
 package org.jruby;
 
+import org.jruby.ast.RestArgNode;
 import org.jruby.ext.jruby.JRubyUtilLibrary;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -66,7 +67,11 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.util.TraceClassVisitor;
 
 import java.util.Map;
+import org.jruby.ast.MultipleAsgn19Node;
+import org.jruby.ast.UnnamedRestArgNode;
+import org.jruby.internal.runtime.methods.MethodArgs2;
 import org.jruby.java.proxies.JavaProxy;
+import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.ExecutionContext;
 import org.jruby.runtime.ObjectAllocator;
 import static org.jruby.runtime.Visibility.*;
@@ -467,7 +472,16 @@ public class RubyJRuby {
                 throw context.getRuntime().newTypeError(maybeClass, context.getRuntime().getClassClass());
             }
 
-            return clazz.__subclasses__(context, args);
+            boolean recursive = false;
+            if (args.length == 1) {
+                if (args[0] instanceof RubyBoolean) {
+                    recursive = args[0].isTrue();
+                } else {
+                    context.getRuntime().newTypeError(args[0], context.getRuntime().fastGetClass("Boolean"));
+                }
+            }
+
+            return RubyArray.newArray(context.getRuntime(), clazz.subclasses(recursive)).freeze(context);
         }
 
         @JRubyMethod(name = "become_java!", optional = 1)
@@ -480,9 +494,9 @@ public class RubyJRuby {
             }
 
             if (args.length > 0) {
-                clazz.reify(args[0].convertToString().asJavaString());
+                clazz.reifyWithAncestors(args[0].convertToString().asJavaString());
             } else {
-                clazz.reify();
+                clazz.reifyWithAncestors();
             }
 
             return JavaUtil.convertJavaToUsableRubyObject(context.getRuntime(), clazz.getReifiedClass());
@@ -596,11 +610,19 @@ public class RubyJRuby {
         @JRubyMethod(name = "times", module = true)
         public static IRubyObject times(IRubyObject recv, Block unusedBlock) {
             Ruby runtime = recv.getRuntime();
-            double system = threadBean.getCurrentThreadCpuTime() / 1000000000.0;
-            double user = threadBean.getCurrentThreadUserTime() / 1000000000.0;
+            long cpu = threadBean.getCurrentThreadCpuTime();
+            long user = threadBean.getCurrentThreadUserTime();
+            if (cpu == -1) {
+                cpu = 0L;
+            }
+            if (user == -1) {
+                user = 0L;
+            }
+            double system_d = (cpu - user) / 1000000000.0;
+            double user_d = user / 1000000000.0;
             RubyFloat zero = runtime.newFloat(0.0);
             return RubyStruct.newStruct(runtime.getTmsStruct(),
-                    new IRubyObject[] { RubyFloat.newFloat(runtime, user), RubyFloat.newFloat(runtime, system), zero, zero },
+                    new IRubyObject[] { RubyFloat.newFloat(runtime, user_d), RubyFloat.newFloat(runtime, system_d), zero, zero },
                     Block.NULL_BLOCK);
         }
     }
@@ -617,21 +639,27 @@ public class RubyJRuby {
         public static IRubyObject methodArgs(IRubyObject recv) {
             Ruby runtime = recv.getRuntime();
             RubyMethod rubyMethod = (RubyMethod)recv;
-            
+            RubyArray argsArray = RubyArray.newArray(runtime);
             DynamicMethod method = rubyMethod.method;
-            
-            if (method instanceof MethodArgs) {
-                RubySymbol req = runtime.newSymbol("req");
-                RubySymbol opt = runtime.newSymbol("opt");
-                RubySymbol rest = runtime.newSymbol("rest");
-                RubySymbol block = runtime.newSymbol("block");
+            RubySymbol req = runtime.newSymbol("req");
+            RubySymbol opt = runtime.newSymbol("opt");
+            RubySymbol rest = runtime.newSymbol("rest");
+            RubySymbol block = runtime.newSymbol("block");
+
+            if (method instanceof MethodArgs2) {
+                return RuntimeHelpers.parameterListToParameters(runtime, ((MethodArgs2)method).getParameterList(), true);
+            } else if (method instanceof MethodArgs) {
                 MethodArgs interpMethod = (MethodArgs)method;
                 ArgsNode args = interpMethod.getArgsNode();
-                RubyArray argsArray = RubyArray.newArray(runtime);
                 
                 ListNode requiredArgs = args.getPre();
                 for (int i = 0; requiredArgs != null && i < requiredArgs.size(); i++) {
-                    argsArray.append(RubyArray.newArray(runtime, req, getNameFrom(runtime, (INameNode) requiredArgs.get(i))));
+                    Node argNode = requiredArgs.get(i);
+                    if (argNode instanceof MultipleAsgn19Node) {
+                        argsArray.append(RubyArray.newArray(runtime, req));
+                    } else {
+                        argsArray.append(RubyArray.newArray(runtime, req, getNameFrom(runtime, (INameNode)argNode)));
+                    }
                 }
                 
                 ListNode optArgs = args.getOptArgs();
@@ -640,22 +668,37 @@ public class RubyJRuby {
                 }
 
                 if (args.getRestArg() >= 0) {
-                    argsArray.append(RubyArray.newArray(runtime, rest, getNameFrom(runtime, args.getRestArgNode())));
+                    RestArgNode restArg = (RestArgNode) args.getRestArgNode();
+
+                    if (restArg instanceof UnnamedRestArgNode) {
+                        if (((UnnamedRestArgNode) restArg).isStar()) {
+                            argsArray.append(RubyArray.newArray(runtime, rest));
+                        }
+                    } else {
+                        argsArray.append(RubyArray.newArray(runtime, rest, getNameFrom(runtime, args.getRestArgNode())));
+                    }
                 }
                 
                 ListNode requiredArgsPost = args.getPost();
                 for (int i = 0; requiredArgsPost != null && i < requiredArgsPost.size(); i++) {
-                    argsArray.append(RubyArray.newArray(runtime, req, getNameFrom(runtime, (INameNode) requiredArgsPost.get(i))));
+                    Node argNode = requiredArgsPost.get(i);
+                    if (argNode instanceof MultipleAsgn19Node) {
+                        argsArray.append(RubyArray.newArray(runtime, req));
+                    } else {
+                        argsArray.append(RubyArray.newArray(runtime, req, getNameFrom(runtime, (INameNode) requiredArgsPost.get(i))));
+                    }
                 }
 
                 if (args.getBlock() != null) {
                     argsArray.append(RubyArray.newArray(runtime, block, getNameFrom(runtime, args.getBlock())));
                 }
-                
-                return argsArray;
+            } else {
+                if (method.getArity() == Arity.OPTIONAL) {
+                    argsArray.append(RubyArray.newArray(runtime, rest));
+                }
             }
-            
-            return runtime.getNil();
+
+            return argsArray;
         }
     }
 

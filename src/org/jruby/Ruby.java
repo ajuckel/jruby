@@ -73,7 +73,6 @@ import org.jruby.compiler.ASTCompiler;
 import org.jruby.compiler.ASTInspector;
 import org.jruby.compiler.JITCompiler;
 import org.jruby.compiler.impl.StandardASMCompiler;
-import org.jruby.compiler.NotCompilableException;
 import org.jruby.exceptions.JumpException;
 import org.jruby.exceptions.MainExitException;
 import org.jruby.exceptions.RaiseException;
@@ -108,6 +107,7 @@ import org.jruby.runtime.encoding.EncodingService;
 import org.jruby.runtime.load.CompiledScriptLoader;
 import org.jruby.runtime.load.Library;
 import org.jruby.runtime.load.LoadService;
+import org.jruby.runtime.profile.IProfileData;
 import org.jruby.runtime.scope.ManyVarsDynamicScope;
 import org.jruby.util.BuiltinScript;
 import org.jruby.util.ByteList;
@@ -125,8 +125,10 @@ import com.kenai.constantine.ConstantSet;
 import com.kenai.constantine.platform.Errno;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.nio.channels.ClosedChannelException;
 import java.util.EnumSet;
 import java.util.concurrent.atomic.AtomicLong;
+import org.jcodings.specific.USASCIIEncoding;
 import org.jruby.RubyInstanceConfig.CompileMode;
 import org.jruby.ast.RootNode;
 import org.jruby.ast.executable.RuntimeCache;
@@ -137,8 +139,10 @@ import org.jruby.interpreter.Interpreter;
 import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.management.BeanManager;
 import org.jruby.management.BeanManagerFactory;
+import org.jruby.platform.Platform;
 import org.jruby.runtime.ClassIndex;
 import org.jruby.runtime.MethodIndex;
+import org.jruby.runtime.load.BasicLibraryService;
 import org.jruby.threading.DaemonThreadFactory;
 import org.jruby.util.io.SelectorPool;
 
@@ -273,6 +277,7 @@ public final class Ruby {
         this.beanManager.register(new Config(this));
         this.beanManager.register(parserStats);
         this.beanManager.register(new ClassCache(this));
+        this.beanManager.register(new org.jruby.management.Runtime(this));
 
         this.runtimeCache = new RuntimeCache();
         runtimeCache.initMethodCache(ClassIndex.MAX_CLASSES * MethodIndex.MAX_METHODS);
@@ -420,9 +425,6 @@ public final class Ruby {
             }
         } finally {
             context.setFileAndLine(oldFile, oldLine);
-            if (config.isProfiling()) {
-                context.getProfileData().printProfile(context, profiledNames, profiledMethods, System.out);
-            }
         }
     }
 
@@ -441,7 +443,7 @@ public final class Ruby {
         if (config.isInlineScript()) {
             return parseInline(inputStream, filename, getCurrentContext().getCurrentScope());
         } else {
-            return parseFile(inputStream, filename, getCurrentContext().getCurrentScope());
+            return parseFileFromMain(inputStream, filename, getCurrentContext().getCurrentScope());
         }
     }
 
@@ -561,30 +563,20 @@ public final class Ruby {
     public IRubyObject runNormally(Node scriptNode) {
         Script script = null;
         boolean compile = getInstanceConfig().getCompileMode().shouldPrecompileCLI();
-        boolean forceCompile = getInstanceConfig().getCompileMode().shouldPrecompileAll();
-        if (compile) {
+        if (compile || config.isShowBytecode()) {
             script = tryCompile(scriptNode, null, new JRubyClassLoader(getJRubyClassLoader()), config.isShowBytecode());
-            if (forceCompile && script == null) {
-                return getNil();
-            }
         }
 
-        if (config.isShowBytecode()) {
-            if (script == null) {
-                // try to force compile the script again, in case we are in a -X-C or dynopt mode
-                script = tryCompile(scriptNode, null, new JRubyClassLoader(getJRubyClassLoader()), config.isShowBytecode());
+        if (script != null) {
+            if (config.isShowBytecode()) {
+                return getNil();
             }
-            // if still null, print error and return
-            if (script == null) {
-                System.err.print("error: bytecode printing only works with JVM bytecode");
-            }
-            return nilObject;
+            
+            return runScript(script);
         } else {
-            if (script != null) {
-                return runScript(script);
-            } else {
-                return runInterpreter(scriptNode);
-            }
+            failForcedCompile(scriptNode);
+            
+            return runInterpreter(scriptNode);
         }
     }
 
@@ -613,6 +605,19 @@ public final class Ruby {
      */
     public Script tryCompile(Node node, ASTInspector inspector) {
         return tryCompile(node, null, new JRubyClassLoader(getJRubyClassLoader()), inspector, false);
+    }
+
+    private void failForcedCompile(Node scriptNode) throws RaiseException {
+        if (config.getCompileMode().shouldPrecompileAll()) {
+            throw newRuntimeError("could not compile and compile mode is 'force': " + scriptNode.getPosition().getFile());
+        }
+    }
+
+    private void handeCompileError(Node node, Throwable t) {
+        if (config.isJitLoggingVerbose() || config.isDebug()) {
+            System.err.println("warning: could not compile: " + node.getPosition().getFile() + "; full trace follows");
+            t.printStackTrace();
+        }
     }
 
     private Script tryCompile(Node node, String cachedClassName, JRubyClassLoader classLoader, boolean dump) {
@@ -652,41 +657,8 @@ public final class Ruby {
             if (config.isJitLogging()) {
                 System.err.println("compiled: " + node.getPosition().getFile());
             }
-        } catch (NotCompilableException nce) {
-            if (config.isJitLoggingVerbose() || config.isDebug()) {
-                System.err.println("warning: not compileable: " + nce.getMessage());
-                nce.printStackTrace();
-            } else {
-                System.err.println("warning: could not compile; pass -d or -J-Djruby.jit.logging.verbose=true for more details");
-            }
-        } catch (ClassNotFoundException e) {
-            if (config.isJitLoggingVerbose() || config.isDebug()) {
-                System.err.println("warning: not compileable: " + e.getMessage());
-                e.printStackTrace();
-            } else {
-                System.err.println("warning: could not compile; pass -d or -J-Djruby.jit.logging.verbose=true for more details");
-            }
-        } catch (InstantiationException e) {
-            if (config.isJitLoggingVerbose() || config.isDebug()) {
-                System.err.println("warning: not compilable: " + e.getMessage());
-                e.printStackTrace();
-            } else {
-                System.err.println("warning: could not compile; pass -d or -J-Djruby.jit.logging.verbose=true for more details");
-            }
-        } catch (IllegalAccessException e) {
-            if (config.isJitLoggingVerbose() || config.isDebug()) {
-                System.err.println("warning: not compilable: " + e.getMessage());
-                e.printStackTrace();
-            } else {
-                System.err.println("warning: could not compile; pass -d or -J-Djruby.jit.logging.verbose=true for more details");
-            }
         } catch (Throwable t) {
-            if (config.isJitLoggingVerbose() || config.isDebug()) {
-                System.err.println("warning: could not compile: " + node.getPosition().getFile() + " because of: \"" + t.getMessage() + "\"");
-                t.printStackTrace();
-            } else {
-                System.err.println("warning: could not compile; pass -d or -J-Djruby.jit.logging.verbose=true for more details");
-            }
+            handeCompileError(node, t);
         }
         
         return script;
@@ -1103,6 +1075,10 @@ public final class Ruby {
         // initialize builtin libraries
         initBuiltins();
         
+        if(config.isProfiling()) {
+            getLoadService().require("jruby/profiler/shutdown_hook");
+        }
+
         // Require in all libraries specified on command line
         for (String scriptName : config.requiredLibraries()) {
             loadService.smartLoad(scriptName);
@@ -1180,11 +1156,9 @@ public final class Ruby {
         RubyEnumerable.createEnumerableModule(this);
         RubyString.createStringClass(this);
 
-        if (is1_9()) {
-            RubyEncoding.createEncodingClass(this);
-            RubyConverter.createConverterClass(this);
-            encodingService = new EncodingService(this);
+        encodingService = new EncodingService(this);
 
+        if (is1_9()) {
             RubyRandom.createRandomClass(this);
         }
 
@@ -1305,8 +1279,6 @@ public final class Ruby {
         if (profile.allowClass("Continuation")) {
             RubyContinuation.createContinuation(this);
         }
-
-        RubyTuple.createTupleClass(this);
     }
 
     public static final int NIL_PREFILLED_ARRAY_SIZE = RubyArray.ARRAY_DEFAULT_SIZE * 8;
@@ -1475,6 +1447,9 @@ public final class Ruby {
         addLazyBuiltin("ffi-internal.jar", "ffi-internal", "org.jruby.ext.ffi.FFIService");
         addLazyBuiltin("tempfile.rb", "tempfile", "org.jruby.libraries.TempfileLibrary");
         addLazyBuiltin("fcntl.rb", "fcntl", "org.jruby.libraries.FcntlLibrary");
+        addLazyBuiltin("rubinius.jar", "rubinius", "org.jruby.ext.rubinius.RubiniusLibrary");
+        addLazyBuiltin("yecht.jar", "yecht", "YechtService");
+
         if (is1_9()) {
             addLazyBuiltin("mathn/complex.jar", "mathn/complex", "org.jruby.ext.mathn.Complex");
             addLazyBuiltin("mathn/rational.jar", "mathn/rational", "org.jruby.ext.mathn.Rational");
@@ -1502,14 +1477,7 @@ public final class Ruby {
             }
         });
         
-        String[] builtins = {"yaml", 
-                             "yaml/yecht", "yaml/baseemitter", "yaml/basenode", 
-                             "yaml/compat", "yaml/constants", "yaml/dbm", 
-                             "yaml/emitter", "yaml/encoding", "yaml/error", 
-                             "yaml/rubytypes", "yaml/store", "yaml/stream", 
-                             "yaml/stringio", "yaml/tag", "yaml/types", 
-                             "yaml/yamlnode", "yaml/ypath", 
-                             "jsignal_internal", "generator_internal"};
+        String[] builtins = {"jsignal_internal", "generator_internal"};
         for (String library : builtins) {
             addBuiltinIfAllowed(library + ".rb", new BuiltinScript(library));
         }
@@ -1518,9 +1486,13 @@ public final class Ruby {
 
         if(is1_9()) {
             // see ruby.c's ruby_init_gems function
-            defineModule("Gem"); // dummy Gem module for prelude
             loadFile("builtin/prelude.rb", getJRubyClassLoader().getResourceAsStream("builtin/prelude.rb"), false);
-            loadFile("builtin/gem_prelude.rb", getJRubyClassLoader().getResourceAsStream("builtin/gem_prelude.rb"), false);
+            if (!config.isDisableGems()) {
+                // NOTE: This has been disabled because gem_prelude is terribly broken.
+                //       We just require 'rubygems' in gem_prelude, at least for now.
+                //defineModule("Gem"); // dummy Gem module for prelude
+                loadFile("builtin/gem_prelude.rb", getJRubyClassLoader().getResourceAsStream("builtin/gem_prelude.rb"), false);
+            }
         }
 
         getLoadService().require("enumerator");
@@ -2303,8 +2275,14 @@ public final class Ruby {
 
     public Node parseFile(InputStream in, String file, DynamicScope scope, int lineNumber) {
         if (parserStats != null) parserStats.addLoadParse();
-        return parser.parse(file, in, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), lineNumber, false, false, true, config));
+        return parser.parse(file, in, scope, new ParserConfiguration(this,
+                lineNumber, false, false, true, config));
+    }
+
+    public Node parseFileFromMain(InputStream in, String file, DynamicScope scope) {
+        if (parserStats != null) parserStats.addLoadParse();
+        return parser.parse(file, in, scope, new ParserConfiguration(this,
+                0, false, false, true, true, config));
     }
     
     public Node parseFile(InputStream in, String file, DynamicScope scope) {
@@ -2313,38 +2291,36 @@ public final class Ruby {
 
     public Node parseInline(InputStream in, String file, DynamicScope scope) {
         if (parserStats != null) parserStats.addEvalParse();
-        return parser.parse(file, in, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), 0, false, true, false, config));
+        ParserConfiguration parserConfig =
+                new ParserConfiguration(this, 0, false, true, false, config);
+        if (is1_9) parserConfig.setDefaultEncoding(getEncodingService().getLocaleEncoding());
+        return parser.parse(file, in, scope, parserConfig);
     }
 
     public Node parseEval(String content, String file, DynamicScope scope, int lineNumber) {
-        byte[] bytes = content.getBytes();
-        
         if (parserStats != null) parserStats.addEvalParse();
-        return parser.parse(file, bytes, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), lineNumber, false, false, false, config));
+        return parser.parse(file, content.getBytes(), scope, new ParserConfiguration(this,
+                lineNumber, false, false, false, false, config));
     }
 
     @Deprecated
     public Node parse(String content, String file, DynamicScope scope, int lineNumber, 
             boolean extraPositionInformation) {
-        byte[] bytes = content.getBytes();
-
-        return parser.parse(file, bytes, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), lineNumber, extraPositionInformation, false, true, config));
+        return parser.parse(file, content.getBytes(), scope, new ParserConfiguration(this,
+                lineNumber, extraPositionInformation, false, true, config));
     }
     
     public Node parseEval(ByteList content, String file, DynamicScope scope, int lineNumber) {
         if (parserStats != null) parserStats.addEvalParse();
-        return parser.parse(file, content, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), lineNumber, false, false, false, config));
+        return parser.parse(file, content, scope, new ParserConfiguration(this,
+                lineNumber, false, false, false, config));
     }
 
     public Node parse(ByteList content, String file, DynamicScope scope, int lineNumber, 
             boolean extraPositionInformation) {
         if (parserStats != null) parserStats.addJRubyModuleParse();
-        return parser.parse(file, content, scope, new ParserConfiguration(getEncodingService(),
-                getKCode(), lineNumber, extraPositionInformation, false, true, config));
+        return parser.parse(file, content, scope, new ParserConfiguration(this,
+                lineNumber, extraPositionInformation, false, true, config));
     }
 
 
@@ -2446,146 +2422,8 @@ public final class Ruby {
             return;
         }
 
-        if (RubyException.TRACE_TYPE == RubyException.RUBINIUS) {
-            printRubiniusTrace(excp);
-            return;
-        }
-
-        ThreadContext context = getCurrentContext();
-        IRubyObject backtrace = excp.callMethod(context, "backtrace");
-
         PrintStream errorStream = getErrorStream();
-        if (backtrace.isNil() || !(backtrace instanceof RubyArray)) {
-            if (context.getFile() != null) {
-                errorStream.print(context.getFile() + ":" + context.getLine());
-            } else {
-                errorStream.print(context.getLine());
-            }
-        } else if (((RubyArray) backtrace).getLength() == 0) {
-            printErrorPos(context, errorStream);
-        } else {
-            IRubyObject mesg = ((RubyArray) backtrace).first();
-
-            if (mesg.isNil()) {
-                printErrorPos(context, errorStream);
-            } else {
-                errorStream.print(mesg);
-            }
-        }
-
-        RubyClass type = excp.getMetaClass();
-        String info = excp.toString();
-
-        if (type == getRuntimeError() && (info == null || info.length() == 0)) {
-            errorStream.print(": unhandled exception\n");
-        } else {
-            String path = type.getName();
-
-            if (info.length() == 0) {
-                errorStream.print(": " + path + '\n');
-            } else {
-                if (path.startsWith("#")) {
-                    path = null;
-                }
-
-                String tail = null;
-                if (info.indexOf("\n") != -1) {
-                    tail = info.substring(info.indexOf("\n") + 1);
-                    info = info.substring(0, info.indexOf("\n"));
-                }
-
-                errorStream.print(": " + info);
-
-                if (path != null) {
-                    errorStream.print(" (" + path + ")\n");
-                }
-
-                if (tail != null) {
-                    errorStream.print(tail + '\n');
-                }
-            }
-        }
-
-        excp.printBacktrace(errorStream);
-    }
-
-    private static final String FIRST_COLOR = "\033[0;31m";
-    private static final String KERNEL_COLOR = "\033[0;36m";
-    private static final String EVAL_COLOR = "\033[0;33m";
-    private static final String CLEAR_COLOR = "\033[0m";
-
-    private void printRubiniusTrace(RubyException exception) {
-        ThreadContext.RubyStackTraceElement[] frames = exception.getBacktraceElements();
-
-        ArrayList firstParts = new ArrayList();
-        int longestFirstPart = 0;
-        for (ThreadContext.RubyStackTraceElement frame : frames) {
-            String firstPart = frame.getClassName() + "#" + frame.getMethodName();
-            if (firstPart.length() > longestFirstPart) longestFirstPart = firstPart.length();
-            firstParts.add(firstPart);
-        }
-
-        // determine spacing
-        int center = longestFirstPart
-                + 2 // initial spaces
-                + 1; // spaces before "at"
-
-        StringBuilder buffer = new StringBuilder();
-
-        buffer
-                .append("An exception has occurred:\n")
-                .append("    ");
-
-        if (exception.getMetaClass() == getRuntimeError() && exception.message(getCurrentContext()).toString().length() == 0) {
-            buffer.append("No current exception (RuntimeError)");
-        } else {
-            buffer.append(exception.message(getCurrentContext()).toString());
-        }
-
-        buffer
-                .append('\n')
-                .append('\n')
-                .append("Backtrace:\n");
-
-        int i = 0;
-        for (ThreadContext.RubyStackTraceElement frame : frames) {
-            String firstPart = (String)firstParts.get(i);
-            String secondPart = frame.getFileName() + ":" + frame.getLineNumber();
-
-            if (i == 0) {
-                buffer.append(FIRST_COLOR);
-            } else if (frame.isBinding() || frame.getFileName().equals("(eval)")) {
-                buffer.append(EVAL_COLOR);
-            } else if (frame.getFileName().indexOf(".java") != -1) {
-                buffer.append(KERNEL_COLOR);
-            }
-            buffer.append("  ");
-            for (int j = 0; j < center - firstPart.length(); j++) {
-                buffer.append(' ');
-            }
-            buffer.append(firstPart);
-            buffer.append(" at ");
-            buffer.append(secondPart);
-            buffer.append(CLEAR_COLOR);
-            buffer.append('\n');
-            i++;
-        }
-
-        PrintStream errorStream = getErrorStream();
-        errorStream.print(buffer.toString());
-    }
-
-    private void printErrorPos(ThreadContext context, PrintStream errorStream) {
-        if (context.getFile() != null) {
-            if (context.getFrameName() != null) {
-                errorStream.print(context.getFile() + ":" + context.getLine());
-                errorStream.print(":in '" + context.getFrameName() + '\'');
-            } else if (context.getLine() != 0) {
-                errorStream.print(context.getFile() + ":" + context.getLine());
-            } else {
-                errorStream.print(context.getFile());
-            }
-        }
+        errorStream.print(config.getTraceType().printBacktrace(excp));
     }
     
     public void loadFile(String scriptName, InputStream in, boolean wrap) {
@@ -2660,17 +2498,18 @@ public final class Ruby {
             }
 
             // script was not found in cache above, so proceed to compile
+            Node scriptNode = parseFile(readStream, filename, null);
             if (script == null) {
-                Node scriptNode = parseFile(readStream, filename, null);
-
                 script = tryCompile(scriptNode, className, basicGetJRubyClassLoader(), false);
             }
-            
-            if (script == null) {
-                System.err.println("Error, could not compile; pass -J-Djruby.jit.logging.verbose=true for more details");
-            }
 
-            runScript(script);
+            if (script == null) {
+                failForcedCompile(scriptNode);
+
+                runInterpreter(scriptNode);
+            } else {
+                runScript(script);
+            }
         } catch (JumpException.ReturnJump rj) {
             return;
         } finally {
@@ -2688,6 +2527,36 @@ public final class Ruby {
             script.load(context, self, IRubyObject.NULL_ARRAY, Block.NULL_BLOCK);
         } catch (JumpException.ReturnJump rj) {
             return;
+        }
+    }
+
+    /**
+     * Load the given BasicLibraryService instance, wrapping it in Ruby framing
+     * to ensure it is isolated from any parent scope.
+     * 
+     * @param extName The name of the extension, to go on the frame wrapping it
+     * @param extension The extension object to load
+     * @param wrap Whether to use a new "self" for toplevel
+     */
+    public void loadExtension(String extName, BasicLibraryService extension, boolean wrap) {
+        IRubyObject self = wrap ? TopSelfFactory.createTopSelf(this) : getTopSelf();
+        ThreadContext context = getCurrentContext();
+        String file = context.getFile();
+
+        try {
+            secure(4); /* should alter global state */
+
+            context.setFile(extName);
+            context.preExtensionLoad(self);
+
+            extension.basicLoad(this);
+        } catch (IOException ioe) {
+            throw newIOErrorFromException(ioe);
+        } catch (JumpException.ReturnJump rj) {
+            return;
+        } finally {
+            context.postNodeEval();
+            context.setFile(file);
         }
     }
 
@@ -2914,6 +2783,16 @@ public final class Ruby {
         getBeanManager().unregisterClassCache();
         getBeanManager().unregisterMethodCache();
 
+        if (getJRubyClassLoader() != null) {
+            getJRubyClassLoader().tearDown(isDebug());
+        }
+
+        if (config.isProfilingEntireRun()) {
+            System.err.println("\nmain thread profile results:");
+            IProfileData profileData = (IProfileData) threadService.getMainThread().getContext().getProfileData();
+            config.makeDefaultProfilePrinter(profileData).printProfile(System.err);
+        }
+
         if (systemExit && status != 0) {
             throw newSystemExit(status);
         }
@@ -3000,9 +2879,7 @@ public final class Ruby {
     public RubyProc newProc(Block.Type type, Block block) {
         if (type != Block.Type.LAMBDA && block.getProcObject() != null) return block.getProcObject();
 
-        RubyProc proc =  RubyProc.newProc(this, type);
-
-        proc.callInit(IRubyObject.NULL_ARRAY, block);
+        RubyProc proc =  RubyProc.newProc(this, block, type);
 
         return proc;
     }
@@ -3010,8 +2887,7 @@ public final class Ruby {
     public RubyProc newBlockPassProc(Block.Type type, Block block) {
         if (type != Block.Type.LAMBDA && block.getProcObject() != null) return block.getProcObject();
 
-        RubyProc proc =  RubyProc.newProc(this, type);
-        proc.initialize(getCurrentContext(), block);
+        RubyProc proc =  RubyProc.newProc(this, block, type);
 
         return proc;
     }
@@ -3135,7 +3011,7 @@ public final class Ruby {
     }
 
     public RaiseException newErrnoEAGAINError(String message) {
-        return newRaiseException(getErrno().fastGetClass("EAGAIN"), message);
+        return newErrnoException(getErrno().fastGetClass("EAGAIN"), message);
     }
 
     public RaiseException newErrnoEISDirError(String message) {
@@ -3239,6 +3115,15 @@ public final class Ruby {
         }
     }
 
+    public RaiseException newErrnoFromInt(int errno) {
+        Errno errnoObj = Errno.valueOf(errno);
+        if (errnoObj == null) {
+            return newSystemCallError("Unknown Error (" + errno + ")");
+        }
+        String message = errnoObj.description();
+        return newErrnoFromInt(errno, message);
+    }
+
     public RaiseException newTypeError(String message) {
         return newRaiseException(getTypeError(), message);
     }
@@ -3276,9 +3161,7 @@ public final class Ruby {
     }
 
     public RaiseException newNoMethodError(String message, String name, IRubyObject args) {
-        RaiseException exception = new RaiseException(new RubyNoMethodError(this, getNoMethodError(), message, name, args), true);
-        exception.preRaise(getCurrentContext());
-        return exception;
+        return new RaiseException(new RubyNoMethodError(this, getNoMethodError(), message, name, args), true);
     }
 
     public RaiseException newNameError(String message, String name) {
@@ -3294,17 +3177,12 @@ public final class Ruby {
             origException.printStackTrace(getErrorStream());
         }
         
-        RaiseException exception = new RaiseException(new RubyNameError(
+        return new RaiseException(new RubyNameError(
                 this, getNameError(), message, name), false);
-        exception.preRaise(getCurrentContext());
-
-        return exception;
     }
 
     public RaiseException newLocalJumpError(RubyLocalJumpError.Reason reason, IRubyObject exitValue, String message) {
-        RaiseException exception = new RaiseException(new RubyLocalJumpError(this, getLocalJumpError(), message, reason, exitValue), true);
-        exception.preRaise(getCurrentContext());
-        return exception;
+        return new RaiseException(new RubyLocalJumpError(this, getLocalJumpError(), message, reason, exitValue), true);
     }
 
     public RaiseException newLocalJumpErrorNoBlock() {
@@ -3340,9 +3218,7 @@ public final class Ruby {
     }
 
     public RaiseException newSystemExit(int status) {
-        RaiseException exception = new RaiseException(RubySystemExit.newInstance(this, status));
-        exception.preRaise(getCurrentContext());
-        return exception;
+        return new RaiseException(RubySystemExit.newInstance(this, status));
     }
 
     public RaiseException newIOError(String message) {
@@ -3354,11 +3230,16 @@ public final class Ruby {
     }
 
     public RaiseException newIOErrorFromException(IOException ioe) {
+        if (ioe instanceof ClosedChannelException) {
+            throw newIOError("closed stream");
+        }
+
         // TODO: this is kinda gross
         if(ioe.getMessage() != null) {
             if (ioe.getMessage().equals("Broken pipe")) {
                 throw newErrnoEPIPEError();
-            } else if (ioe.getMessage().equals("Connection reset by peer")) {
+            } else if (ioe.getMessage().equals("Connection reset by peer") ||
+                    (Platform.IS_WINDOWS && ioe.getMessage().contains("connection was aborted"))) {
                 throw newErrnoECONNRESETError();
             }
             return newRaiseException(getIOError(), ioe.getMessage());
@@ -3422,9 +3303,26 @@ public final class Ruby {
      * @return
      */
     private RaiseException newRaiseException(RubyClass exceptionClass, String message) {
-        RaiseException re = new RaiseException(this, exceptionClass, message, true);
-        re.preRaise(getCurrentContext());
-        return re;
+        return new RaiseException(this, exceptionClass, message, true);
+    }
+
+    /**
+     * Generate one of the ERRNO exceptions. This differs from the normal logic
+     * by avoiding the generation of a backtrace. Many ERRNO values are expected,
+     * such as EAGAIN, and JRuby pays a very high cost to generate backtraces that
+     * are never used. The flags -Xerrno.backtrace=true or the property
+     * jruby.errno.backtrace=true forces all errno exceptions to generate a backtrace.
+     * 
+     * @param exceptionClass
+     * @param message
+     * @return
+     */
+    private RaiseException newErrnoException(RubyClass exceptionClass, String message) {
+        if (RubyInstanceConfig.ERRNO_BACKTRACE) {
+            return new RaiseException(this, exceptionClass, message, true);
+        } else {
+            return new RaiseException(this, exceptionClass, ERRNO_BACKTRACE_MESSAGE, RubyArray.newEmptyArray(this), true);
+        }
     }
 
     // Equivalent of Data_Wrap_Struct
@@ -3859,13 +3757,27 @@ public final class Ruby {
     }
 
     /**
+     * Get the list of method names being profiled
+     */
+    public String[] getProfiledNames() {
+        return profiledNames;
+    }
+
+    /**
+     * Get the list of method objects for methods being profiled
+     */
+    public DynamicMethod[] getProfiledMethods() {
+        return profiledMethods;
+    }
+
+    /**
      * Add a method and its name to the profiling arrays, so it can be printed out
      * later.
      *
      * @param name the name of the method
      * @param method
      */
-    public void addProfiledMethod(String name, DynamicMethod method) {
+    public synchronized void addProfiledMethod(String name, DynamicMethod method) {
         if (!config.isProfiling()) return;
         if (method.isUndefined()) return;
         if (method.getSerialNumber() > MAX_PROFILE_METHODS) return;
@@ -3880,8 +3792,60 @@ public final class Ruby {
             System.arraycopy(profiledMethods, 0, newProfiledMethods, 0, profiledMethods.length);
             profiledMethods = newProfiledMethods;
         }
-        profiledNames[index] = name;
-        profiledMethods[index] = method;
+
+        // only add the first one we encounter, since others will probably share the original
+        if (profiledNames[index] == null) {
+            profiledNames[index] = name;
+            profiledMethods[index] = method;
+        }
+    }
+    
+    /**
+     * Increment the count of exceptions generated by code in this runtime.
+     */
+    public void incrementExceptionCount() {
+        exceptionCount.incrementAndGet();
+    }
+    
+    /**
+     * Get the current exception count.
+     * 
+     * @return he current exception count
+     */
+    public int getExceptionCount() {
+        return exceptionCount.get();
+    }
+    
+    /**
+     * Increment the count of backtraces generated by code in this runtime.
+     */
+    public void incrementBacktraceCount() {
+        backtraceCount.incrementAndGet();
+    }
+    
+    /**
+     * Get the current backtrace count.
+     * 
+     * @return the current backtrace count
+     */
+    public int getBacktraceCount() {
+        return backtraceCount.get();
+    }
+    
+    /**
+     * Increment the count of backtraces generated by code in this runtime.
+     */
+    public void incrementCallerCount() {
+        callerCount.incrementAndGet();
+    }
+    
+    /**
+     * Get the current backtrace count.
+     * 
+     * @return the current backtrace count
+     */
+    public int getCallerCount() {
+        return callerCount.get();
     }
 
     private volatile int constantGeneration = 1;
@@ -4083,8 +4047,20 @@ public final class Ruby {
     private static final int MAX_PROFILE_METHODS = 100000;
 
     // The list of method names associated with method serial numbers
-    private String[] profiledNames = new String[0];
+    public String[] profiledNames = new String[0];
 
     // The method objects for serial numbers
-    private DynamicMethod[] profiledMethods = new DynamicMethod[0];
+    public DynamicMethod[] profiledMethods = new DynamicMethod[0];
+    
+    // Message for Errno exceptions that will not generate a backtrace
+    public static final String ERRNO_BACKTRACE_MESSAGE = "errno backtraces disabled; run with -Xerrno.backtrace=true to enable";
+    
+    // Count of RaiseExceptions generated by code running in this runtime
+    private final AtomicInteger exceptionCount = new AtomicInteger();
+    
+    // Count of exception backtraces generated by code running in this runtime
+    private final AtomicInteger backtraceCount = new AtomicInteger();
+    
+    // Count of Kernel#caller backtraces generated by code running in this runtime
+    private final AtomicInteger callerCount = new AtomicInteger();
 }

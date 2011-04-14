@@ -30,9 +30,6 @@ package org.jruby.ext.ffi.io;
 
 import org.jruby.Ruby;
 import org.jruby.ext.posix.LibC;
-import org.jruby.ext.posix.POSIX;
-import org.jruby.ext.posix.POSIXFactory;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ByteChannel;
@@ -83,6 +80,8 @@ public class FileDescriptorByteChannel implements ByteChannel {
         int n = libc.read(fd, dst, dst.remaining());
         if (n > 0) {
             dst.position(dst.position() + n);
+        } else if (n == 0) {
+          return -1; // EOF
         }
         return n;
     }

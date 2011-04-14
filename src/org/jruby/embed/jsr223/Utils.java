@@ -29,14 +29,14 @@
  */
 package org.jruby.embed.jsr223;
 
-import java.util.List;
 import java.util.Set;
 import javax.script.Bindings;
 import javax.script.ScriptContext;
 import javax.script.ScriptEngine;
 import org.jruby.embed.AttributeName;
+import org.jruby.embed.LocalVariableBehavior;
 import org.jruby.embed.ScriptingContainer;
-import org.jruby.embed.variable.BiVariable;
+import org.jruby.embed.variable.TransientLocalVariable;
 
 /**
  * A collection of JSR223 specific utility methods.
@@ -88,7 +88,7 @@ public class Utils {
         Set<String> keys = bindings.keySet();
         for (String key : keys) {
             Object value = bindings.get(key);
-            Object oldValue = put(container, receiver, key, value);
+            put(container, receiver, key, value);
         }
 
         // if key of globalMap exists in engineMap, this key-value pair should be skipped.
@@ -98,7 +98,7 @@ public class Utils {
         for (String key : keys) {
             if (container.getVarMap().containsKey(key)) continue;
             Object value = bindings.get(key);
-            Object oldValue = put(container, receiver, key, value);
+            put(container, receiver, key, value);
         }
     }
 
@@ -112,6 +112,13 @@ public class Utils {
         Object receiver = getReceiverObject(jrubyContext);
         
         Bindings engineMap = jrubyContext.getEngineScopeBindings();
+        int size = engineMap.keySet().size();
+        String[] names = engineMap.keySet().toArray(new String[size]);
+        for (int i=0; i<names.length; i++) {
+            if (shouldLVarBeDeleted(container, names[i])) {
+                engineMap.remove(names[i]);
+            }
+        }
         Set<String> keys = container.getVarMap().keySet();
         if (keys != null && keys.size() > 0) {
             for (String key : keys) {
@@ -162,5 +169,12 @@ public class Utils {
         } else {
             return key;
         }
+    }
+    
+    private static boolean shouldLVarBeDeleted(ScriptingContainer container, String key) {
+        LocalVariableBehavior behavior = 
+                container.getProvider().getVarMap().getVariableInterceptor().getLocalVariableBehavior();
+        if (behavior != LocalVariableBehavior.TRANSIENT) return false;
+        return TransientLocalVariable.isValidName(key);
     }
 }

@@ -59,8 +59,8 @@ import org.jruby.compiler.impl.SkinnyMethodAdapter;
 import org.jruby.exceptions.RaiseException;
 import org.jruby.internal.runtime.methods.DynamicMethod;
 import org.jruby.internal.runtime.methods.JavaMethod;
-import org.jruby.internal.runtime.methods.UndefinedMethod;
 import org.jruby.java.codegen.RealClassGenerator;
+import org.jruby.java.codegen.Reified;
 import org.jruby.javasupport.Java;
 import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.Block;
@@ -106,8 +106,6 @@ public class RubyClass extends RubyModule {
         classClass.undefineMethod("extend_object");
         
         classClass.defineAnnotatedMethods(RubyClass.class);
-        
-        classClass.addMethod("new", new SpecificArityNew(classClass, PUBLIC));
     }
     
     public static final ObjectAllocator CLASS_ALLOCATOR = new ObjectAllocator() {
@@ -635,6 +633,8 @@ public class RubyClass extends RubyModule {
                     if(self.respondsTo(name)) {
                         throw e;
                     } else {
+                        // we swallow, so we also must clear $!
+                        context.setErrorInfo(context.nil);
                         return null;
                     }
                 } else {
@@ -786,71 +786,39 @@ public class RubyClass extends RubyModule {
     /** rb_class_new_instance
     *
     */
-    public IRubyObject newInstance(ThreadContext context, IRubyObject[] args, Block block) {
+    @JRubyMethod(name = "new", omit = true)
+    public IRubyObject newInstance(ThreadContext context, Block block) {
         IRubyObject obj = allocate();
-        baseCallSites[CS_IDX_INITIALIZE].call(context, this, obj, args, block);
+        baseCallSites[CS_IDX_INITIALIZE].call(context, obj, obj, block);
         return obj;
     }
-    
-    public static class SpecificArityNew extends JavaMethod {
-        public SpecificArityNew(RubyModule implClass, Visibility visibility) {
-            super(implClass, visibility);
-        }
-        public IRubyObject call(ThreadContext context, IRubyObject self, RubyModule clazz, String name, IRubyObject[] args, Block block) {
-            preBacktraceOnly(context, name);
-            try {
-                RubyClass cls = (RubyClass)self;
-                IRubyObject obj = cls.allocate();
-                cls.baseCallSites[CS_IDX_INITIALIZE].call(context, self, obj, args, block);
-                return obj;
-            } finally {
-                postBacktraceOnly(context);
-            }
-        }
-        public IRubyObject call(ThreadContext context, IRubyObject self, RubyModule clazz, String name, Block block) {
-            preBacktraceOnly(context, name);
-            try {
-                RubyClass cls = (RubyClass)self;
-                IRubyObject obj = cls.allocate();
-                cls.baseCallSites[CS_IDX_INITIALIZE].call(context, self, obj, block);
-                return obj;
-            } finally {
-                postBacktraceOnly(context);
-            }
-        }
-        public IRubyObject call(ThreadContext context, IRubyObject self, RubyModule clazz, String name, IRubyObject arg0, Block block) {
-            preBacktraceOnly(context, name);
-            try {
-                RubyClass cls = (RubyClass)self;
-                IRubyObject obj = cls.allocate();
-                cls.baseCallSites[CS_IDX_INITIALIZE].call(context, self, obj, arg0, block);
-                return obj;
-            } finally {
-                postBacktraceOnly(context);
-            }
-        }
-        public IRubyObject call(ThreadContext context, IRubyObject self, RubyModule clazz, String name, IRubyObject arg0, IRubyObject arg1, Block block) {
-            preBacktraceOnly(context, name);
-            try {
-                RubyClass cls = (RubyClass)self;
-                IRubyObject obj = cls.allocate();
-                cls.baseCallSites[CS_IDX_INITIALIZE].call(context, self, obj, arg0, arg1, block);
-                return obj;
-            } finally {
-                postBacktraceOnly(context);
-            }
-        }
-        public IRubyObject call(ThreadContext context, IRubyObject self, RubyModule clazz, String name, IRubyObject arg0, IRubyObject arg1, IRubyObject arg2, Block block) {
-            preBacktraceOnly(context, name);
-            try {
-                RubyClass cls = (RubyClass)self;
-                IRubyObject obj = cls.allocate();
-                cls.baseCallSites[CS_IDX_INITIALIZE].call(context, self, obj, arg0, arg1, arg2, block);
-                return obj;
-            } finally {
-                postBacktraceOnly(context);
-            }
-        }
+
+    @JRubyMethod(name = "new", omit = true)
+    public IRubyObject newInstance(ThreadContext context, IRubyObject arg0, Block block) {
+        IRubyObject obj = allocate();
+        baseCallSites[CS_IDX_INITIALIZE].call(context, obj, obj, arg0, block);
+        return obj;
+    }
+
+    @JRubyMethod(name = "new", omit = true)
+    public IRubyObject newInstance(ThreadContext context, IRubyObject arg0, IRubyObject arg1, Block block) {
+        IRubyObject obj = allocate();
+        baseCallSites[CS_IDX_INITIALIZE].call(context, obj, obj, arg0, arg1, block);
+        return obj;
+    }
+
+    @JRubyMethod(name = "new", omit = true)
+    public IRubyObject newInstance(ThreadContext context, IRubyObject arg0, IRubyObject arg1, IRubyObject arg2, Block block) {
+        IRubyObject obj = allocate();
+        baseCallSites[CS_IDX_INITIALIZE].call(context, obj, obj, arg0, arg1, arg2, block);
+        return obj;
+    }
+
+    @JRubyMethod(name = "new", rest = true, omit = true)
+    public IRubyObject newInstance(ThreadContext context, IRubyObject[] args, Block block) {
+        IRubyObject obj = allocate();
+        baseCallSites[CS_IDX_INITIALIZE].call(context, obj, obj, args, block);
+        return obj;
     }
 
     /** rb_class_initialize
@@ -1066,17 +1034,6 @@ public class RubyClass extends RubyModule {
         return superClazz != null ? superClazz : runtime.getNil();
     }
 
-    @JRubyMethod(optional = 1)
-    public IRubyObject __subclasses__(ThreadContext context, IRubyObject[] args) {
-        boolean recursive = false;
-        if (args.length > 0) {
-            recursive = args[0].isTrue();
-        }
-
-        return RubyArray.newArray(context.getRuntime(), subclasses(recursive)).freeze(context);
-    }
-
-
     private void checkNotInitialized() {
         if (superClass != null || (runtime.is1_9() && this == runtime.getBasicObject())) {
             throw runtime.newTypeError("already initialized class");
@@ -1143,6 +1100,70 @@ public class RubyClass extends RubyModule {
         }
     };
 
+    /**
+     * Whether this class can be reified into a Java class. Currently only objects
+     * that descend from Object (or descend from Ruby-based classes that descend
+     * from Object) can be reified.
+     *
+     * @return true if the class can be reified, false otherwise
+     */
+    public boolean isReifiable() {
+        RubyClass realSuper = null;
+
+        // already reified is not reifiable
+        if (reifiedClass != null) return false;
+
+        // root classes are not reifiable
+        if (superClass == null || (realSuper = superClass.getRealClass()) == null) return false;
+
+        Class reifiedSuper = realSuper.reifiedClass;
+        
+        // if super has been reified or is a native class
+        if (reifiedSuper != null) {
+            
+            // super must be Object, BasicObject, or a reified user class
+            return reifiedSuper == RubyObject.class ||
+                    reifiedSuper == RubyBasicObject.class ||
+                    Reified.class.isAssignableFrom(reifiedSuper);
+        } else {
+            // non-native, non-reified super; recurse
+            return realSuper.isReifiable();
+        }
+    }
+
+    /**
+     * Reify this class, first reifying all its ancestors. This causes the
+     * reified class and all ancestors' reified classes to come into existence,
+     * so any future changes will not be reflected.
+     */
+    public void reifyWithAncestors() {
+        if (isReifiable()) {
+            RubyClass realSuper = getSuperClass().getRealClass();
+
+            if (realSuper.reifiedClass == null) realSuper.reifyWithAncestors();
+            reify();
+        }
+    }
+
+    /**
+     * Reify this class, first reifying all its ancestors. This causes the
+     * reified class and all ancestors' reified classes to come into existence,
+     * so any future changes will not be reflected.
+     *
+     * This form also accepts a string argument indicating a path in which to dump
+     * the intermediate reified class bytes.
+     *
+     * @param classDumpDir the path in which to dump reified class bytes
+     */
+    public void reifyWithAncestors(String classDumpDir) {
+        if (isReifiable()) {
+            RubyClass realSuper = getSuperClass().getRealClass();
+
+            if (realSuper.reifiedClass == null) realSuper.reifyWithAncestors(classDumpDir);
+            reify(classDumpDir);
+        }
+    }
+
     public synchronized void reify() {
         reify(null);
     }
@@ -1167,7 +1188,12 @@ public class RubyClass extends RubyModule {
         String javaName = "rubyobj." + name.replaceAll("::", ".");
         String javaPath = "rubyobj/" + name.replaceAll("::", "/");
         OneShotClassLoader parentCL;
-        if (superClass.getRealClass().getReifiedClass().getClassLoader() instanceof OneShotClassLoader) {
+        Class parentReified = superClass.getRealClass().getReifiedClass();
+        if (parentReified == null) {
+            throw getClassRuntime().newTypeError("class " + getName() + " parent class is not yet reified");
+        }
+        
+        if (parentReified.getClassLoader() instanceof OneShotClassLoader) {
             parentCL = (OneShotClassLoader)superClass.getRealClass().getReifiedClass().getClassLoader();
         } else {
             parentCL = new OneShotClassLoader(runtime.getJRubyClassLoader());
@@ -1178,9 +1204,14 @@ public class RubyClass extends RubyModule {
         }
 
         Class[] interfaces = Java.getInterfacesFromRubyClass(this);
-        String[] interfaceNames = new String[interfaces.length];
+        String[] interfaceNames = new String[interfaces.length + 1];
+        
+        // mark this as a Reified class
+        interfaceNames[0] = p(Reified.class);
+
+        // add the other user-specified interfaces
         for (int i = 0; i < interfaces.length; i++) {
-            interfaceNames[i] = p(interfaces[i]);
+            interfaceNames[i + 1] = p(interfaces[i]);
         }
 
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
@@ -1232,7 +1263,8 @@ public class RubyClass extends RubyModule {
 
         // gather a list of instance methods, so we don't accidentally make static ones that conflict
         Set<String> instanceMethods = new HashSet<String>();
-        
+
+        // define instance methods
         for (Map.Entry<String,DynamicMethod> methodEntry : getMethods().entrySet()) {
             String methodName = methodEntry.getKey();
             String javaMethodName = JavaNameMangler.mangleStringForCleanJavaIdentifier(methodName);
@@ -1301,7 +1333,8 @@ public class RubyClass extends RubyModule {
 
             m.end();
         }
-        
+
+        // define class/static methods
         for (Map.Entry<String,DynamicMethod> methodEntry : getMetaClass().getMethods().entrySet()) {
             String methodName = methodEntry.getKey();
             String javaMethodName = JavaNameMangler.mangleStringForCleanJavaIdentifier(methodName);
@@ -1342,7 +1375,7 @@ public class RubyClass extends RubyModule {
                 // indices for temp values
                 Class[] params = new Class[methodSignature.length - 1];
                 System.arraycopy(methodSignature, 1, params, 0, params.length);
-                int baseIndex = 1;
+                int baseIndex = 0;
                 for (Class paramType : params) {
                     if (paramType == double.class || paramType == long.class) {
                         baseIndex += 2;

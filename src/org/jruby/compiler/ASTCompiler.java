@@ -143,12 +143,15 @@ import org.jruby.internal.runtime.methods.DynamicMethod;
 import org.jruby.internal.runtime.methods.DynamicMethod.NativeCall;
 import org.jruby.internal.runtime.methods.InterpretedMethod;
 import org.jruby.internal.runtime.methods.JittedMethod;
+import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.parser.StaticScope;
 import org.jruby.runtime.Arity;
 import org.jruby.runtime.BlockBody;
 import org.jruby.runtime.CallType;
+import org.jruby.runtime.MethodIndex;
 import org.jruby.runtime.callsite.CacheEntry;
 import org.jruby.runtime.callsite.CachingCallSite;
+import org.jruby.util.StringSupport;
 
 /**
  *
@@ -627,11 +630,8 @@ public class ASTCompiler {
 
     public void compileArray(Node node, BodyCompiler context, boolean expr) {
         ArrayNode arrayNode = (ArrayNode) node;
-
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
         
-        if (doit) {
+        if (expr) {
             ArrayCallback callback = new ArrayCallback() {
                 public void nextValue(BodyCompiler context, Object sourceArray, int index) {
                     Node node = (Node) ((Object[]) sourceArray)[index];
@@ -646,8 +646,6 @@ public class ASTCompiler {
             } else {
                 context.createNewArray(childNodes.toArray(), callback, arrayNode.isLightweight());
             }
-
-            if (popit) context.consumeCurrentValue();
         } else {
             for (Iterator<Node> iter = arrayNode.childNodes().iterator(); iter.hasNext();) {
                 Node nextNode = iter.next();
@@ -696,10 +694,9 @@ public class ASTCompiler {
         ArgsCatNode argsCatNode = (ArgsCatNode) node;
 
         compile(argsCatNode.getFirstNode(), context,true);
-        context.ensureRubyArray();
         compile(argsCatNode.getSecondNode(), context,true);
-        splatCurrentValue(context);
-        context.concatArrays();
+        context.argsCat();
+
         // TODO: don't require pop
         if (!expr) context.consumeCurrentValue();
     }
@@ -754,12 +751,7 @@ public class ASTCompiler {
     }
 
     public void compileBignum(Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.createNewBignum(((BignumNode) node).getValue());
-        } else {
-            context.createNewBignum(((BignumNode) node).getValue());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.createNewBignum(((BignumNode) node).getValue());
     }
 
     public void compileBlock(Node node, BodyCompiler context, boolean expr) {
@@ -844,26 +836,11 @@ public class ASTCompiler {
 
         if (argsCallback != null && argsCallback.getArity() == 1) {
             Node argument = callNode.getArgsNode().childNodes().get(0);
-            if (name.length() == 1) {
-                switch (name.charAt(0)) {
-                case '+': case '-': case '*': case '/': case '<': case '>':
-                    if (argument instanceof FixnumNode) {
-                        context.getInvocationCompiler().invokeBinaryFixnumRHS(name, receiverCallback, ((FixnumNode)argument).getValue());
-                        if (!expr) context.consumeCurrentValue();
-                        return;
-                    }
-                }
-            } else if (name.length() == 2) {
+            if (MethodIndex.hasFastOps(name)) {
                 if (argument instanceof FixnumNode) {
-                    switch (name.charAt(0)) {
-                    case '<': case '>': case '=': case '[':
-                        switch (name.charAt(1)) {
-                        case '=': case '<': case ']':
-                            context.getInvocationCompiler().invokeBinaryFixnumRHS(name, receiverCallback, ((FixnumNode)argument).getValue());
-                            if (!expr) context.consumeCurrentValue();
-                            return;
-                        }
-                    }
+                    context.getInvocationCompiler().invokeBinaryFixnumRHS(name, receiverCallback, ((FixnumNode)argument).getValue());
+                    if (!expr) context.consumeCurrentValue();
+                    return;
                 }
             }
         }
@@ -1138,12 +1115,11 @@ public class ASTCompiler {
         FastSwitchType switchType = getHomogeneousSwitchType(whenNodes);
         if (switchType != null && !RubyInstanceConfig.FULL_TRACE_ENABLED) {
             // NOTE: Currently this optimization is limited to the following situations:
-            // * All expressions must be int-ranged literal fixnums
-            // It also still emits the code for the "safe" when logic, which is rather
-            // wasteful (since it essentially doubles each code body). As such it is
-            // normally disabled, but it serves as an example of how this optimization
-            // could be done. Ideally, it should be combined with the when processing
-            // to improve code reuse before it's generally available.
+            // * All expressions are int-ranged literal fixnums
+            // * All expressions are literal symbols
+            // * All expressions are literal strings
+            // If the case value is not of the same type as the when values, the
+            // default === logic applies.
             switchCases = new HashMap<CompilerCallback, int[]>();
         }
         for (Node node : whenNodes) {
@@ -1513,15 +1489,9 @@ public class ASTCompiler {
     }
 
     public void compileDefined(final Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) {
-                compileGetDefinitionBase(((DefinedNode) node).getExpressionNode(), context);
-                context.stringOrNil();
-            }
-        } else {
+        if (expr) {
             compileGetDefinitionBase(((DefinedNode) node).getExpressionNode(), context);
             context.stringOrNil();
-            if (!expr) context.consumeCurrentValue();
         }
     }
 
@@ -1563,6 +1533,7 @@ public class ASTCompiler {
             case GLOBALASGNNODE:
             case LOCALASGNNODE:
             case MULTIPLEASGNNODE:
+            case MULTIPLEASGN19NODE:
             case OPASGNNODE:
             case OPASGNANDNODE:
             case OPASGNORNODE:
@@ -1570,11 +1541,13 @@ public class ASTCompiler {
             case INSTASGNNODE: // simple assignment cases
                 context.pushString("assignment");
                 break;
-            case NOTNODE: // all these just evaluate and then do expression if there's no error
-            case ANDNODE:
+            case ANDNODE: // all these just evaluate and then do expression if there's no error
             case ORNODE:
             case DSTRNODE:
             case DREGEXPNODE:
+                compileDefinedAndOrDStrDRegexp(node, context);
+                break;
+            case NOTNODE: // evaluates, and under 1.9 flips to "method" if result is nonnull
                 {
                     context.rescue(new BranchCallback() {
 
@@ -1589,26 +1562,14 @@ public class ASTCompiler {
                                     context.pushNull();
                                 }
                             }, String.class);
+                    context.definedNot();
                     break;
                 }
             case BACKREFNODE:
-                context.backref();
-                context.isInstanceOf(RubyMatchData.class,
-                        new BranchCallback() {
-
-                            public void branch(BodyCompiler context) {
-                                context.pushString("$" + ((BackRefNode) node).getType());
-                            }
-                        },
-                        new BranchCallback() {
-
-                            public void branch(BodyCompiler context) {
-                                context.pushNull();
-                            }
-                        });
+                compileDefinedBackref(node, context);
                 break;
             case DVARNODE:
-                context.pushString("local-variable(in-block)");
+                compileDefinedDVar(node, context);
                 break;
             case FALSENODE:
                 context.pushString("false");
@@ -1627,19 +1588,7 @@ public class ASTCompiler {
                 context.pushString("nil");
                 break;
             case NTHREFNODE:
-                context.isCaptured(((NthRefNode) node).getMatchNumber(),
-                        new BranchCallback() {
-
-                            public void branch(BodyCompiler context) {
-                                context.pushString("$" + ((NthRefNode) node).getMatchNumber());
-                            }
-                        },
-                        new BranchCallback() {
-
-                            public void branch(BodyCompiler context) {
-                                context.pushNull();
-                            }
-                        });
+                compileDefinedNthref(node, context);
                 break;
             case SELFNODE:
                 context.pushString("self");
@@ -1757,65 +1706,8 @@ public class ASTCompiler {
                     break;
                 }
             case CALLNODE:
-                {
-                    final CallNode iVisited = (CallNode) node;
-                    Object isnull = context.getNewEnding();
-                    Object ending = context.getNewEnding();
-                    compileGetDefinition(iVisited.getReceiverNode(), context);
-                    context.ifNull(isnull);
-
-                    context.rescue(new BranchCallback() {
-
-                                public void branch(BodyCompiler context) {
-                                    compile(iVisited.getReceiverNode(), context,true); //[IRubyObject]
-                                    context.duplicateCurrentValue(); //[IRubyObject, IRubyObject]
-                                    context.metaclass(); //[IRubyObject, RubyClass]
-                                    context.duplicateCurrentValue(); //[IRubyObject, RubyClass, RubyClass]
-                                    context.getVisibilityFor(iVisited.getName()); //[IRubyObject, RubyClass, Visibility]
-                                    context.duplicateCurrentValue(); //[IRubyObject, RubyClass, Visibility, Visibility]
-                                    final Object isfalse = context.getNewEnding();
-                                    Object isreal = context.getNewEnding();
-                                    Object ending = context.getNewEnding();
-                                    context.isPrivate(isfalse, 3); //[IRubyObject, RubyClass, Visibility]
-                                    context.isNotProtected(isreal, 1); //[IRubyObject, RubyClass]
-                                    context.selfIsKindOf(isreal); //[IRubyObject]
-                                    context.consumeCurrentValue();
-                                    context.go(isfalse);
-                                    context.setEnding(isreal); //[]
-
-                                    context.isMethodBound(iVisited.getName(), new BranchCallback() {
-
-                                                public void branch(BodyCompiler context) {
-                                                    compileGetArgumentDefinition(iVisited.getArgsNode(), context, "method");
-                                                }
-                                            },
-                                            new BranchCallback() {
-
-                                                public void branch(BodyCompiler context) {
-                                                    context.go(isfalse);
-                                                }
-                                            });
-                                    context.go(ending);
-                                    context.setEnding(isfalse);
-                                    context.pushNull();
-                                    context.setEnding(ending);
-                                }
-                            }, JumpException.class,
-                            new BranchCallback() {
-
-                                public void branch(BodyCompiler context) {
-                                    context.pushNull();
-                                }
-                            }, String.class);
-
-                    //          context.swapValues();
-            //context.consumeCurrentValue();
-                    context.go(ending);
-                    context.setEnding(isnull);
-                    context.pushNull();
-                    context.setEnding(ending);
-                    break;
-                }
+                compileDefinedCall(node, context);
+                break;
             case CLASSVARNODE:
                 {
                     ClassVarNode iVisited = (ClassVarNode) node;
@@ -2011,6 +1903,88 @@ public class ASTCompiler {
         }
     }
 
+    protected void compileDefinedAndOrDStrDRegexp(final Node node, BodyCompiler context) {
+        context.rescue(new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        compile(node, context, false);
+                        context.pushString("expression");
+                    }
+                }, JumpException.class,
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushNull();
+                    }
+                }, String.class);
+    }
+
+    protected void compileDefinedCall(final Node node, BodyCompiler context) {
+            final CallNode iVisited = (CallNode) node;
+            Object isnull = context.getNewEnding();
+            Object ending = context.getNewEnding();
+            compileGetDefinition(iVisited.getReceiverNode(), context);
+            context.ifNull(isnull);
+
+            context.rescue(new BranchCallback() {
+
+                        public void branch(BodyCompiler context) {
+                            compile(iVisited.getReceiverNode(), context, true); //[IRubyObject]
+                            context.definedCall(iVisited.getName());
+                        }
+                    }, JumpException.class,
+                    new BranchCallback() {
+
+                        public void branch(BodyCompiler context) {
+                            context.pushNull();
+                        }
+                    }, String.class);
+
+            //          context.swapValues();
+    //context.consumeCurrentValue();
+            context.go(ending);
+            context.setEnding(isnull);
+            context.pushNull();
+            context.setEnding(ending);
+    }
+
+    protected void compileDefinedDVar(final Node node, BodyCompiler context) {
+        context.pushString("local-variable(in-block)");
+    }
+
+    protected void compileDefinedBackref(final Node node, BodyCompiler context) {
+        context.backref();
+        context.isInstanceOf(RubyMatchData.class,
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushString("$" + ((BackRefNode) node).getType());
+                    }
+                },
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushNull();
+                    }
+                });
+    }
+
+    protected void compileDefinedNthref(final Node node, BodyCompiler context) {
+        context.isCaptured(((NthRefNode) node).getMatchNumber(),
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushString("$" + ((NthRefNode) node).getMatchNumber());
+                    }
+                },
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushNull();
+                    }
+                });
+    }
+
     public void compileDAsgn(Node node, BodyCompiler context, boolean expr) {
         final DAsgnNode dasgnNode = (DAsgnNode) node;
 
@@ -2080,7 +2054,8 @@ public class ASTCompiler {
         context.defineNewMethod(
                 defnNode.getName(), defnNode.getArgsNode().getArity().getValue(),
                 defnNode.getScope(), body, args, null, inspector, isAtRoot,
-                defnNode.getPosition().getFile(), defnNode.getPosition().getStartLine());
+                defnNode.getPosition().getFile(), defnNode.getPosition().getStartLine(),
+                RuntimeHelpers.encodeParameterList(argsNode));
         // TODO: don't require pop
         if (!expr) context.consumeCurrentValue();
     }
@@ -2137,7 +2112,8 @@ public class ASTCompiler {
         context.defineNewMethod(
                 defsNode.getName(), defsNode.getArgsNode().getArity().getValue(),
                 defsNode.getScope(), body, args, receiver, inspector, false,
-                defsNode.getPosition().getFile(), defsNode.getPosition().getStartLine());
+                defsNode.getPosition().getFile(), defsNode.getPosition().getStartLine(),
+                RuntimeHelpers.encodeParameterList(argsNode));
         // TODO: don't require pop
         if (!expr) context.consumeCurrentValue();
     }
@@ -2219,10 +2195,7 @@ public class ASTCompiler {
     public void compileDot(Node node, BodyCompiler context, boolean expr) {
         final DotNode dotNode = (DotNode) node;
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             CompilerCallback beginEndCallback = new CompilerCallback() {
                 public void call(BodyCompiler context) {
                     compile(dotNode.getBeginNode(), context, true);
@@ -2232,7 +2205,6 @@ public class ASTCompiler {
 
             context.createNewRange(beginEndCallback, dotNode.isExclusive());
         }
-        if (popit) context.consumeCurrentValue();
     }
 
     public void compileDRegexp(Node node, BodyCompiler context, boolean expr) {
@@ -2252,12 +2224,8 @@ public class ASTCompiler {
                     }
                 };
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
-            context.createNewRegexp(createStringCallback, dregexpNode.getOptions());
-            if (popit) context.consumeCurrentValue();
+        if (expr) {
+            context.createNewRegexp(createStringCallback, dregexpNode.getOptions().toEmbeddedOptions());
         } else {
             // not an expression, only compile the elements
             for (Node nextNode : dregexpNode.childNodes()) {
@@ -2277,12 +2245,8 @@ public class ASTCompiler {
                     }
                 };
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             context.createNewString(dstrCallback, dstrNode.size());
-            if (popit) context.consumeCurrentValue();
         } else {
             // not an expression, only compile the elements
             for (Node nextNode : dstrNode.childNodes()) {
@@ -2302,12 +2266,8 @@ public class ASTCompiler {
                     }
                 };
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             context.createNewSymbol(dstrCallback, dsymbolNode.size());
-            if (popit) context.consumeCurrentValue();
         } else {
             // not an expression, only compile the elements
             for (Node nextNode : dsymbolNode.childNodes()) {
@@ -2319,12 +2279,7 @@ public class ASTCompiler {
     public void compileDVar(Node node, BodyCompiler context, boolean expr) {
         DVarNode dvarNode = (DVarNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.getVariableCompiler().retrieveLocalVariable(dvarNode.getIndex(), dvarNode.getDepth());
-        } else {
-            context.getVariableCompiler().retrieveLocalVariable(dvarNode.getIndex(), dvarNode.getDepth());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.getVariableCompiler().retrieveLocalVariable(dvarNode.getIndex(), dvarNode.getDepth());
     }
 
     public void compileDXStr(Node node, BodyCompiler context, boolean expr) {
@@ -2394,15 +2349,9 @@ public class ASTCompiler {
     }
 
     public void compileFalse(Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) {
-                context.loadFalse();
-                context.pollThreadEvents();
-            }
-        } else {
+        if (expr) {
             context.loadFalse();
             context.pollThreadEvents();
-            if (!expr) context.consumeCurrentValue();
         }
     }
 
@@ -2472,12 +2421,7 @@ public class ASTCompiler {
     public void compileFixnum(Node node, BodyCompiler context, boolean expr) {
         FixnumNode fixnumNode = (FixnumNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.createNewFixnum(fixnumNode.getValue());
-        } else {
-            context.createNewFixnum(fixnumNode.getValue());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.createNewFixnum(fixnumNode.getValue());
     }
 
     public void compileFlip(Node node, BodyCompiler context, boolean expr) {
@@ -2585,12 +2529,7 @@ public class ASTCompiler {
     public void compileFloat(Node node, BodyCompiler context, boolean expr) {
         FloatNode floatNode = (FloatNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.createNewFloat(floatNode.getValue());
-        } else {
-            context.createNewFloat(floatNode.getValue());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.createNewFloat(floatNode.getValue());
     }
 
     public void compileFor(Node node, BodyCompiler context, boolean expr) {
@@ -2716,11 +2655,8 @@ public class ASTCompiler {
 
     public void compileGlobalVar(Node node, BodyCompiler context, boolean expr) {
         GlobalVarNode globalVarNode = (GlobalVarNode) node;
-
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
         
-        if (doit) {
+        if (expr) {
             if (globalVarNode.getName().length() == 2) {
                 switch (globalVarNode.getName().charAt(1)) {
                 case '_':
@@ -2736,8 +2672,6 @@ public class ASTCompiler {
                 context.retrieveGlobalVariable(globalVarNode.getName());
             }
         }
-        
-        if (popit) context.consumeCurrentValue();
     }
 
     public void compileHash(Node node, BodyCompiler context, boolean expr) {
@@ -2745,10 +2679,7 @@ public class ASTCompiler {
     }
     
     protected void compileHashCommon(HashNode hashNode, BodyCompiler context, boolean expr) {
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             if (hashNode.getListNode() == null || hashNode.getListNode().size() == 0) {
                 context.createEmptyHash();
                 return;
@@ -2769,8 +2700,6 @@ public class ASTCompiler {
             } else {
                 context.createNewHash(hashNode.getListNode(), hashCallback, hashNode.getListNode().size() / 2);
             }
-
-            if (popit) context.consumeCurrentValue();
         } else {
             for (Node nextNode : hashNode.getListNode().childNodes()) {
                 compile(nextNode, context, false);
@@ -2849,12 +2778,7 @@ public class ASTCompiler {
     public void compileInstVar(Node node, BodyCompiler context, boolean expr) {
         InstVarNode instVarNode = (InstVarNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.retrieveInstanceVariable(instVarNode.getName());
-        } else {
-            context.retrieveInstanceVariable(instVarNode.getName());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.retrieveInstanceVariable(instVarNode.getName());
     }
 
     public void compileIter(Node node, BodyCompiler context) {
@@ -2935,12 +2859,7 @@ public class ASTCompiler {
     public void compileLocalVar(Node node, BodyCompiler context, boolean expr) {
         LocalVarNode localVarNode = (LocalVarNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.getVariableCompiler().retrieveLocalVariable(localVarNode.getIndex(), localVarNode.getDepth());
-        } else {
-            context.getVariableCompiler().retrieveLocalVariable(localVarNode.getIndex(), localVarNode.getDepth());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.getVariableCompiler().retrieveLocalVariable(localVarNode.getIndex(), localVarNode.getDepth());
     }
 
     public void compileMatch(Node node, BodyCompiler context, boolean expr) {
@@ -3189,22 +3108,12 @@ public class ASTCompiler {
     public void compileNthRef(Node node, BodyCompiler context, boolean expr) {
         NthRefNode nthRefNode = (NthRefNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.nthRef(nthRefNode.getMatchNumber());
-        } else {
-            context.nthRef(nthRefNode.getMatchNumber());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.nthRef(nthRefNode.getMatchNumber());
     }
 
     public void compileNil(Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) {
-                context.loadNil();
-            }
-        } else {
+        if (expr) {
             context.loadNil();
-            if (!expr) context.consumeCurrentValue();
         }
     }
 
@@ -3588,12 +3497,7 @@ public class ASTCompiler {
     public void compileRegexp(Node node, BodyCompiler context, boolean expr) {
         RegexpNode reNode = (RegexpNode) node;
 
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.createNewRegexp(reNode.getValue(), reNode.getOptions());
-        } else {
-            context.createNewRegexp(reNode.getValue(), reNode.getOptions());
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.createNewRegexp(reNode.getValue(), reNode.getOptions().toEmbeddedOptions());
     }
 
     public void compileRescue(Node node, BodyCompiler context, boolean expr) {
@@ -3767,12 +3671,7 @@ public class ASTCompiler {
     }
 
     public void compileSelf(Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) context.retrieveSelf();
-        } else {
-            context.retrieveSelf();
-            if (!expr) context.consumeCurrentValue();
-        }
+        if (expr) context.retrieveSelf();
     }
 
     public void compileSplat(Node node, BodyCompiler context, boolean expr) {
@@ -3792,17 +3691,13 @@ public class ASTCompiler {
     public void compileStr(Node node, BodyCompiler context, boolean expr) {
         StrNode strNode = (StrNode) node;
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             if (strNode instanceof FileNode) {
                 context.loadFilename();
             } else {
-                context.createNewString(strNode.getValue());
+                context.createNewString(strNode.getValue(), strNode.getCodeRange());
             }
         }
-        if (popit) context.consumeCurrentValue();
     }
 
     public void compileSuper(Node node, BodyCompiler context, boolean expr) {
@@ -3844,15 +3739,9 @@ public class ASTCompiler {
     }
 
     public void compileTrue(Node node, BodyCompiler context, boolean expr) {
-        if (RubyInstanceConfig.PEEPHOLE_OPTZ) {
-            if (expr) {
-                context.loadTrue();
-                context.pollThreadEvents();
-            }
-        } else {
+        if (expr) {
             context.loadTrue();
             context.pollThreadEvents();
-            if (!expr) context.consumeCurrentValue();
         }
     }
 
@@ -3980,7 +3869,8 @@ public class ASTCompiler {
             }
 
             public void call(BodyCompiler context) {
-                context.createNewString(xstrNode.getValue());
+                // FIXME: shouldn't this have codeRange like StrNode?
+                context.createNewString(xstrNode.getValue(), StringSupport.CR_UNKNOWN);
             }
         };
         context.getInvocationCompiler().invokeDynamic("`", null, argsCallback, CallType.FUNCTIONAL, null, false);
@@ -4016,14 +3906,9 @@ public class ASTCompiler {
     }
 
     public void compileZArray(Node node, BodyCompiler context, boolean expr) {
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             context.createEmptyArray();
         }
-
-        if (popit) context.consumeCurrentValue();
     }
 
     public void compileZSuper(Node node, BodyCompiler context, boolean expr) {

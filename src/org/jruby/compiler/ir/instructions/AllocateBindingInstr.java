@@ -24,7 +24,7 @@ public class AllocateBindingInstr extends Instr {
     public AllocateBindingInstr(IRExecutionScope scope) {
         super(Operation.ALLOC_BINDING);
         
-        this.scope = getClosestMethodAncestor(scope);
+        this.scope = scope.getClosestMethodAncestor();
     }
 
     // ENEBO: Should we be reallocing this every time?
@@ -34,18 +34,15 @@ public class AllocateBindingInstr extends Instr {
 
     public void simplifyOperands(Map<Operand, Operand> valueMap) {}
 
-    private static IRMethod getClosestMethodAncestor(IRExecutionScope scope) {
-        while (!(scope instanceof IRMethod)) {
-            scope = (IRExecutionScope)scope.getLexicalParent();
-        }
-
-        return (IRMethod)scope;
-    }
-
     public Instr cloneForInlining(InlinerInfo ii) {
         // The frame will now be allocated in the caller's scope
         return new AllocateBindingInstr(ii.callerCFG.getScope());
     }
+
+    // Can this instruction raise exceptions?
+	 // If this instruction raises an exception, you are in deep doo-doo.
+    @Override
+    public boolean canRaiseException() { return false; }
 
     @Override
     public String toString() {

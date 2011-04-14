@@ -44,7 +44,6 @@ import org.jruby.Ruby;
 import org.jruby.RubyArray;
 import org.jruby.RubyBignum;
 import org.jruby.RubyClass;
-import org.jruby.RubyEncoding;
 import org.jruby.RubyFixnum;
 import org.jruby.RubyFloat;
 import org.jruby.RubyHash;
@@ -56,9 +55,9 @@ import org.jruby.RubyStruct;
 import org.jruby.RubySymbol;
 import org.jruby.exceptions.RaiseException;
 import org.jruby.javasupport.util.RuntimeHelpers;
-import org.jruby.runtime.ClassIndex;
 import org.jruby.runtime.Constants;
 import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.runtime.encoding.EncodingCapable;
 import org.jruby.util.ByteList;
 
 /**
@@ -72,13 +71,19 @@ public class UnmarshalStream extends InputStream {
     private final IRubyObject proc;
     private final InputStream inputStream;
     private final boolean taint;
+    private final boolean untrust;
 
     public UnmarshalStream(Ruby runtime, InputStream in, IRubyObject proc, boolean taint) throws IOException {
+        this(runtime, in, proc, taint, false);
+    }
+    
+    public UnmarshalStream(Ruby runtime, InputStream in, IRubyObject proc, boolean taint, boolean untrust) throws IOException {
         this.runtime = runtime;
         this.cache = new UnmarshalCache(runtime);
         this.proc = proc;
         this.inputStream = in;
         this.taint = taint;
+        this.untrust = untrust;
 
         int major = in.read(); // Major
         int minor = in.read(); // Minor
@@ -95,6 +100,11 @@ public class UnmarshalStream extends InputStream {
     // r_object
     public IRubyObject unmarshalObject() throws IOException {
         return unmarshalObject(new MarshalState(false));
+    }
+
+    // r_object
+    public IRubyObject unmarshalObject(boolean callProc) throws IOException {
+        return unmarshalObject(new MarshalState(false), callProc);
     }
 
     // introduced for keeping ivar read state recursively.
@@ -116,17 +126,22 @@ public class UnmarshalStream extends InputStream {
     
     // r_object0
     public IRubyObject unmarshalObject(MarshalState state) throws IOException {
+        return unmarshalObject(state, true);
+    }
+
+    // r_object0
+    public IRubyObject unmarshalObject(MarshalState state, boolean callProc) throws IOException {
         int type = readUnsignedByte();
         IRubyObject result = null;
         if (cache.isLinkType(type)) {
             result = cache.readLink(this, type);
+            if (callProc && runtime.is1_9()) return doCallProcForLink(result, type);
         } else {
-            result = unmarshalObjectDirectly(type, state);
+            result = unmarshalObjectDirectly(type, state, callProc);
         }
 
-        if(taint) {
-            result.setTaint(true);
-        }
+        result.setTaint(taint);
+        result.setUntrusted(untrust);
 
         return result;
     }
@@ -148,8 +163,24 @@ public class UnmarshalStream extends InputStream {
         if (!value.isClass()) throw runtime.newArgumentError(path + " does not refer class");
         return (RubyClass)value;
     }
-    
-    private IRubyObject unmarshalObjectDirectly(int type, MarshalState state) throws IOException {
+
+    private IRubyObject doCallProcForLink(IRubyObject result, int type) {
+        if (proc != null && type != ';') {
+            // return the result of the proc, but not for symbols
+            return RuntimeHelpers.invoke(getRuntime().getCurrentContext(), proc, "call", result);
+        }
+        return result;
+    }
+
+    private IRubyObject doCallProcForObj(IRubyObject result) {
+        if (proc != null) {
+            // return the result of the proc, but not for symbols
+            return RuntimeHelpers.invoke(getRuntime().getCurrentContext(), proc, "call", result);
+        }
+        return result;
+    }
+
+    private IRubyObject unmarshalObjectDirectly(int type, MarshalState state, boolean callProc) throws IOException {
         IRubyObject rubyObj = null;
         switch (type) {
             case 'I':
@@ -158,7 +189,7 @@ public class UnmarshalStream extends InputStream {
                 if (childState.isIvarWaiting()) {
                     defaultVariablesUnmarshal(rubyObj);
                 }
-                break;
+                return rubyObj;
             case '0' :
                 rubyObj = runtime.getNil();
                 break;
@@ -238,10 +269,15 @@ public class UnmarshalStream extends InputStream {
                 throw getRuntime().newArgumentError("dump format error(" + (char)type + ")");
         }
 
-        if (proc != null && type != ':') {
+        if (runtime.is1_9()) {
+            if (callProc) {
+                return doCallProcForObj(rubyObj);
+            }
+        } else if (type != ':') {
             // call the proc, but not for symbols
-            RuntimeHelpers.invoke(getRuntime().getCurrentContext(), proc, "call", rubyObj);
+            doCallProcForObj(rubyObj);
         }
+        
         return rubyObj;
     }
 
@@ -310,7 +346,7 @@ public class UnmarshalStream extends InputStream {
     }
 
     private IRubyObject defaultObjectUnmarshal() throws IOException {
-        RubySymbol className = (RubySymbol) unmarshalObject();
+        RubySymbol className = (RubySymbol) unmarshalObject(false);
 
         RubyClass type = null;
         try {
@@ -335,12 +371,14 @@ public class UnmarshalStream extends InputStream {
 
         RubyClass cls = object.getMetaClass().getRealClass();
         for (int i = count; --i >= 0; ) {
-            IRubyObject key = unmarshalObject();
-            if (i == count - 1) { // first ivar
-                if (runtime.is1_9() && object instanceof RubyString && count >= 1) { // 1.9 string encoding
-                    RubyString strObj = (RubyString)object;
+            IRubyObject key = unmarshalObject(false);
+            if (i == 0) { // first ivar
+                if (runtime.is1_9()
+                        && (object instanceof RubyString || object instanceof RubyRegexp)
+                        && count >= 1) { // 1.9 string encoding
+                    EncodingCapable strObj = (EncodingCapable)object;
 
-                    if (key.asJavaString().equals("E")) {
+                    if (key.asJavaString().equals(MarshalStream.SYMBOL_ENCODING_SPECIAL)) {
                         // special case for USASCII and UTF8
                         if (unmarshalObject().isTrue()) {
                             strObj.setEncoding(UTF8Encoding.INSTANCE);
@@ -349,6 +387,8 @@ public class UnmarshalStream extends InputStream {
                         }
                         continue;
                     } else if (key.asJavaString().equals("encoding")) {
+                        // read off " byte for the string
+                        read();
                         ByteList encodingName = unmarshalString();
                         Entry entry = runtime.getEncodingService().findEncodingOrAliasEntry(encodingName);
                         if (entry == null) {
@@ -368,7 +408,7 @@ public class UnmarshalStream extends InputStream {
     }
 
     private IRubyObject uclassUnmarshall() throws IOException {
-        RubySymbol className = (RubySymbol)unmarshalObject();
+        RubySymbol className = (RubySymbol)unmarshalObject(false);
 
         RubyClass type = (RubyClass)runtime.getClassFromPath(className.asJavaString());
 
@@ -381,7 +421,7 @@ public class UnmarshalStream extends InputStream {
     }
 
     private IRubyObject userUnmarshal(MarshalState state) throws IOException {
-        String className = unmarshalObject().asJavaString();
+        String className = unmarshalObject(false).asJavaString();
         ByteList marshaled = unmarshalString();
         RubyClass classInstance = findClass(className);
         RubyString data = RubyString.newString(getRuntime(), marshaled);
@@ -395,7 +435,7 @@ public class UnmarshalStream extends InputStream {
     }
 
     private IRubyObject userNewUnmarshal() throws IOException {
-        String className = unmarshalObject().asJavaString();
+        String className = unmarshalObject(false).asJavaString();
         RubyClass classInstance = findClass(className);
         IRubyObject result = classInstance.allocate();
         registerLinkTarget(result);

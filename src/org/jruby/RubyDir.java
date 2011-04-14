@@ -62,6 +62,7 @@ import static org.jruby.CompatVersion.*;
 public class RubyDir extends RubyObject {
     private RubyString path;       // What we passed to the constructor for method 'path'
     protected JRubyFile dir;
+    private long lastModified = Long.MIN_VALUE;
     private String[] snapshot;     // snapshot of contents of directory
     private int pos;               // current position in directory
     private boolean isOpen = true;
@@ -93,10 +94,22 @@ public class RubyDir extends RubyObject {
         if (!isTaint() && getRuntime().getSafeLevel() >= 4)throw getRuntime().newSecurityError("Insecure: operation on untainted Dir");
 
         testFrozen("Dir");
-
+        update();
+        
         if (!isOpen) throw getRuntime().newIOError("closed directory");
     }
 
+    private void update() {
+        if (snapshot == null || dir.exists() && dir.lastModified() > lastModified) {
+            lastModified = dir.lastModified();
+            List<String> snapshotList = new ArrayList<String>();
+            snapshotList.add(".");
+            snapshotList.add("..");
+            snapshotList.addAll(getContents(dir));
+            snapshot = (String[]) snapshotList.toArray(new String[snapshotList.size()]);
+        }
+    }
+    
     /**
      * Creates a new <code>Dir</code>.  This method takes a snapshot of the
      * contents of the directory at creation time, so changes to the contents
@@ -115,6 +128,7 @@ public class RubyDir extends RubyObject {
         String adjustedPath = RubyFile.adjustRootPathOnWindows(getRuntime(), newPath.toString(), null);
         checkDirIsTwoSlashesOnWindows(getRuntime(), adjustedPath);
 
+        dir = JRubyFile.create(getRuntime().getCurrentDirectory(), adjustedPath);
         List<String> snapshotList = RubyDir.getEntries(getRuntime(), adjustedPath);
         snapshot = (String[]) snapshotList.toArray(new String[snapshotList.size()]);
 
@@ -164,16 +178,22 @@ public class RubyDir extends RubyObject {
     }
 
     @JRubyMethod(name = "[]", required = 1, rest = true, meta = true)
-    public static IRubyObject aref(IRubyObject recv, IRubyObject[] args) {
+    public static IRubyObject aref(ThreadContext context, IRubyObject recv, IRubyObject[] args) {
+        Ruby runtime = context.getRuntime();
         List<ByteList> dirs;
         if (args.length == 1) {
-            ByteList globPattern = args[0].convertToString().getByteList();
-            dirs = Dir.push_glob(getCWD(recv.getRuntime()), globPattern, 0);
+            ByteList globPattern = null;
+            if (runtime.is1_9() && args[0].respondsTo("to_path")) {
+                globPattern = args[0].callMethod(context, "to_path").convertToString().getByteList();
+            } else {
+                globPattern = args[0].convertToString().getByteList();
+            }
+            dirs = Dir.push_glob(getCWD(runtime), globPattern, 0);
         } else {
-            dirs = dirGlobs(getCWD(recv.getRuntime()), args, 0);
+            dirs = dirGlobs(getCWD(runtime), args, 0);
         }
 
-        return asRubyStringList(recv.getRuntime(), dirs);
+        return asRubyStringList(runtime, dirs);
     }
 
     /**
@@ -190,7 +210,12 @@ public class RubyDir extends RubyObject {
         List<ByteList> dirs;
         IRubyObject tmp = args[0].checkArrayType();
         if (tmp.isNil()) {
-            ByteList globPattern = args[0].convertToString().getByteList();
+            ByteList globPattern = null;
+            if (runtime.is1_9() && args[0].respondsTo("to_path")) {
+                globPattern = args[0].callMethod(context, "to_path").convertToString().getByteList();
+            } else {
+                globPattern = args[0].convertToString().getByteList();
+            }
             dirs = Dir.push_glob(runtime.getCurrentDirectory(), globPattern, flags);
         } else {
             dirs = dirGlobs(getCWD(runtime), ((RubyArray) tmp).toJavaArray(), flags);
@@ -218,13 +243,19 @@ public class RubyDir extends RubyObject {
     /**
      * Returns an array containing all of the filenames in the given directory.
      */
-    @JRubyMethod(name = "entries", required = 1, meta = true, compat = RUBY1_8)
+    @JRubyMethod(name = "entries", meta = true, compat = RUBY1_8)
     public static RubyArray entries(IRubyObject recv, IRubyObject path) {
         return entriesCommon(recv.getRuntime(), path.convertToString().getUnicodeValue());
     }
 
-    @JRubyMethod(name = "entries", required = 1, meta = true, compat = RUBY1_9)
+    @JRubyMethod(name = "entries", meta = true, compat = RUBY1_9)
     public static RubyArray entries19(ThreadContext context, IRubyObject recv, IRubyObject arg) {
+        return entriesCommon(context.getRuntime(), getPath19(context, arg));
+    }
+
+    @JRubyMethod(name = "entries", meta = true, compat = RUBY1_9)
+    public static RubyArray entries19(ThreadContext context, IRubyObject recv, IRubyObject arg, IRubyObject opts) {
+        // FIXME: do something with opts
         return entriesCommon(context.getRuntime(), getPath19(context, arg));
     }
 
@@ -384,7 +415,9 @@ public class RubyDir extends RubyObject {
     public static RubyString getwd(IRubyObject recv) {
         Ruby ruby = recv.getRuntime();
 
-        return RubyString.newUnicodeString(ruby, getCWD(ruby));
+        RubyString pwd = RubyString.newUnicodeString(ruby, getCWD(ruby));
+        pwd.setTaint(true);
+        return pwd;
     }
 
     /**
@@ -513,6 +546,7 @@ public class RubyDir extends RubyObject {
      * Moves to a position <code>d</code>.  <code>pos</code> must be a value
      * returned by <code>tell</code> or 0.
      */
+    
     @JRubyMethod(name = "seek", required = 1)
     public IRubyObject seek(IRubyObject newPos) {
         checkDir();
@@ -523,7 +557,8 @@ public class RubyDir extends RubyObject {
 
     @JRubyMethod(name = "pos=", required = 1)
     public IRubyObject set_pos(IRubyObject newPos) {
-        this.pos = RubyNumeric.fix2int(newPos);
+        int pos2 = RubyNumeric.fix2int(newPos);
+        if (pos2 >= 0) this.pos = pos2;
         return newPos;
     }
 
@@ -577,16 +612,30 @@ public class RubyDir extends RubyObject {
      * @throws  IOError if <code>path</code> is not a directory.
      */
     protected static JRubyFile getDir(final Ruby runtime, final String path, final boolean mustExist) {
-        JRubyFile result = JRubyFile.create(runtime.getCurrentDirectory(), path);
-        if (mustExist && !result.exists()) {
-            throw runtime.newErrnoENOENTError("No such file or directory - " + path);
+        String dir = path;
+        String[] pathParts = RubyFile.splitURI(path);
+        if (pathParts != null) {
+            if (pathParts[0].equals("file:") && pathParts[1].length() > 0 && pathParts[1].indexOf("!/") == -1) {
+                dir = pathParts[1];
+            } else {
+                throw runtime.newErrnoENOTDIRError(dir + " is not a directory");
+            }
         }
+
+        JRubyFile result = JRubyFile.create(runtime.getCurrentDirectory(), dir);
+
+        if (mustExist && !result.exists()) {
+            throw runtime.newErrnoENOENTError("No such file or directory - " + dir);
+        }
+
         boolean isDirectory = result.isDirectory();
 
-        if (path.startsWith("file:") || (mustExist && !isDirectory)) {
+        if (mustExist && !isDirectory) {
             throw runtime.newErrnoENOTDIRError(path + " is not a directory");
-        } else if (!mustExist && isDirectory) {
-            throw runtime.newErrnoEEXISTError("File exists - " + path);
+        }
+
+        if (!mustExist && isDirectory) {
+            throw runtime.newErrnoEEXISTError("File exists - " + dir);
         }
 
         return result;

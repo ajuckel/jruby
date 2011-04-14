@@ -63,8 +63,9 @@ import org.jruby.exceptions.RaiseException;
 import org.jruby.platform.Platform;
 import org.jruby.runtime.Constants;
 import org.jruby.runtime.builtin.IRubyObject;
-import org.jruby.runtime.load.LoadService.SuffixType;
 import org.jruby.util.JRubyFile;
+
+import static org.jruby.util.URLUtil.getPath;
 
 /**
  * <b>How require works in JRuby</b>
@@ -163,6 +164,8 @@ public class LoadService {
     protected final Map<String, IAutoloadMethod> autoloadMap = new HashMap<String, IAutoloadMethod>();
 
     protected final Ruby runtime;
+
+    protected boolean caseInsensitiveFS = false;
     
     public LoadService(Ruby runtime) {
         this.runtime = runtime;
@@ -213,11 +216,24 @@ public class LoadService {
                     addPath(rubyDir + "site_ruby" + sep + "shared");
                     addPath(rubyDir + Constants.RUBY_MAJOR_VERSION);
                 }
+
+                String lowerCaseJRubyHome = jrubyHome.toLowerCase();
+                String upperCaseJRubyHome = lowerCaseJRubyHome.toUpperCase();
+
+                try {
+                    String canonNormal = new File(jrubyHome).getCanonicalPath();
+                    String canonLower = new File(lowerCaseJRubyHome).getCanonicalPath();
+                    String canonUpper = new File(upperCaseJRubyHome).getCanonicalPath();
+                    if (canonNormal.equals(canonLower) && canonLower.equals(canonUpper)) {
+                        caseInsensitiveFS = true;
+                    }
+                } catch (Exception e) {}
             }
+
         } catch(SecurityException ignore) {}
         
         // "." dir is used for relative path loads from a given file, as in require '../foo/bar'
-        if (runtime.getSafeLevel() == 0) {
+        if (!runtime.is1_9() && runtime.getSafeLevel() == 0) {
             addPath(".");
         }
     }
@@ -339,7 +355,7 @@ public class LoadService {
         }
         @Override
         public long startLoad(String file) {
-            int i = indent.incrementAndGet();
+            indent.incrementAndGet();
             System.err.println(getIndentString() + "-> " + file);
             return System.currentTimeMillis();
         }
@@ -387,9 +403,14 @@ public class LoadService {
                 classLoader = runtime.getInstanceConfig().getLoader();
             }
 
-            Library library = (Library) classLoader.loadClass(className).newInstance();
-
-            library.load(runtime, false);
+            Object libObject = classLoader.loadClass(className).newInstance();
+            if (libObject instanceof Library) {
+                Library library = (Library)libObject;
+                library.load(runtime, false);
+            } else if (libObject instanceof BasicLibraryService) {
+                BasicLibraryService service = (BasicLibraryService)libObject;
+                service.basicLoad(runtime);
+            }
         } catch (RaiseException re) {
             throw re;
         } catch (Throwable e) {
@@ -435,11 +456,35 @@ public class LoadService {
     }
 
     public void removeInternalLoadedFeature(String name) {
-        loadedFeaturesInternal.remove(name);
+        if (caseInsensitiveFS) {
+            // on a case-insensitive filesystem, we need to search case-insensitively
+            // to remove the loaded feature
+            for (Iterator iter = loadedFeaturesInternal.iterator(); iter.hasNext();) {
+                Object feature = iter.next();
+                if (feature.toString().equalsIgnoreCase(name)) {
+                    iter.remove();
+                }
+            }
+        } else {
+            loadedFeaturesInternal.remove(name);
+        }
     }
 
     protected boolean featureAlreadyLoaded(RubyString loadNameRubyString) {
-        return loadedFeaturesInternal.contains(loadNameRubyString);
+        if (caseInsensitiveFS) {
+            String name = loadNameRubyString.toString();
+            // on a case-insensitive filesystem, we need to search case-insensitively
+            // to find the loaded feature
+            for (Iterator iter = loadedFeaturesInternal.iterator(); iter.hasNext();) {
+                Object feature = iter.next();
+                if (feature.toString().equalsIgnoreCase(name)) {
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            return loadedFeaturesInternal.contains(loadNameRubyString);
+        }
     }
 
     protected boolean isJarfileLibrary(SearchState state, final String file) {
@@ -569,7 +614,7 @@ public class LoadService {
 
                 // quietly try to load the class
                 Class theClass = runtime.getJavaSupport().loadJavaClassQuiet(className, Ruby.getClassLoader());
-                state.library = new ClassExtensionLibrary(theClass);
+                state.library = new ClassExtensionLibrary(className + ".java", theClass);
             } catch (Exception ee) {
                 state.library = null;
                 runtime.getGlobalVariables().clear("$!");
@@ -1234,7 +1279,7 @@ public class LoadService {
     /* Directories and unavailable resources are not able to open a stream. */
     protected boolean isRequireable(URL loc) {
         if (loc != null) {
-                if (loc.getProtocol().equals("file") && new java.io.File(loc.getFile()).isDirectory()) {
+                if (loc.getProtocol().equals("file") && new java.io.File(getPath(loc)).isDirectory()) {
                         return false;
                 }
                 
@@ -1265,8 +1310,10 @@ public class LoadService {
             String path = "classpath:/" + name;
             // special case for typical jar:file URLs, but only if the name didn't have
             // the classpath scheme explicitly
-            if (!isClasspathScheme && loc.getProtocol().equals("jar") && isRequireable(loc)) {
-                path = loc.getPath();
+            if (!isClasspathScheme &&
+                    (loc.getProtocol().equals("jar") || loc.getProtocol().equals("file"))
+                    && isRequireable(loc)) {
+                path = getPath(loc);
             }
             LoadServiceResource foundResource = new LoadServiceResource(loc, path);
             debugLogFound(foundResource);
@@ -1298,5 +1345,16 @@ public class LoadService {
             s = "./" + s;
         }
         return s;
+    }
+
+    /**
+     * Is the jruby home dir on a case-insensitive fs. Determined by comparing
+     * a canonicalized jruby home with canonicalized lower and upper-case versions
+     * of the same path.
+     *
+     * @return true if jruby home is on a case-insensitive FS; false otherwise
+     */
+    public boolean isCaseInsensitiveFS() {
+        return caseInsensitiveFS;
     }
 }

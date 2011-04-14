@@ -39,10 +39,11 @@ package org.jruby;
 import org.jruby.util.io.STDIO;
 import java.util.HashMap;
 import java.util.Map;
+import org.jcodings.Encoding;
 
 import org.jruby.anno.JRubyMethod;
 import org.jruby.common.IRubyWarnings.ID;
-import org.jruby.environment.OSEnvironment;
+import org.jruby.util.OSEnvironment;
 import org.jruby.internal.runtime.ValueAccessor;
 import org.jruby.javasupport.JavaUtil;
 import org.jruby.javasupport.util.RuntimeHelpers;
@@ -53,7 +54,10 @@ import org.jruby.runtime.IAccessor;
 import org.jruby.runtime.ReadonlyGlobalVariable;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.util.ByteList;
 import org.jruby.util.KCode;
+import org.jruby.util.RegexpOptions;
+import org.jruby.util.io.BadDescriptorException;
 
 /** This class initializes global variables and constants.
  * 
@@ -146,9 +150,8 @@ public class RubyGlobal {
                 return super.delete(context, key, org.jruby.runtime.Block.NULL_BLOCK);
             }
 
-            //return super.aset(getRuntime().newString("sadfasdF"), getRuntime().newString("sadfasdF"));
-            return super.op_aset(context, RuntimeHelpers.invoke(context, key, "to_str"),
-                    value.isNil() ? getRuntime().getNil() : RuntimeHelpers.invoke(context, value, "to_str"));
+            return super.op_aset(context, normalizeEnvString(RuntimeHelpers.invoke(context, key, "to_str")),
+                    value.isNil() ? getRuntime().getNil() : normalizeEnvString(RuntimeHelpers.invoke(context, value, "to_str")));
         }
 
         private RubyString getCorrectKey(IRubyObject key, ThreadContext context) {
@@ -168,6 +171,17 @@ public class RubyGlobal {
                 }
             }
             return actualKey;
+        }
+        
+        private IRubyObject normalizeEnvString(IRubyObject str) {
+            if (str instanceof RubyString) {
+                Encoding enc = getRuntime().getEncodingService().getLocaleEncoding();
+                RubyString newStr = getRuntime().newString(new ByteList(str.toString().getBytes(), enc));
+                newStr.setFrozen(true);
+                return newStr;
+            } else {
+                return str;
+            }
         }
     }
     
@@ -256,7 +270,7 @@ public class RubyGlobal {
         if(runtime.getInstanceConfig().getInputFieldSeparator() == null) {
             runtime.defineVariable(new GlobalVariable(runtime, "$;", runtime.getNil()));
         } else {
-            runtime.defineVariable(new GlobalVariable(runtime, "$;", RubyRegexp.newRegexp(runtime, runtime.getInstanceConfig().getInputFieldSeparator(), 0)));
+            runtime.defineVariable(new GlobalVariable(runtime, "$;", RubyRegexp.newRegexp(runtime, runtime.getInstanceConfig().getInputFieldSeparator(), new RegexpOptions())));
         }
         
         Boolean verbose = runtime.getInstanceConfig().getVerbose();
@@ -668,7 +682,11 @@ public class RubyGlobal {
                 
                 // HACK: in order to have stdout/err act like ttys and flush always,
                 // we set anything assigned to stdout/stderr to sync
-                io.getHandler().setSync(true);
+                try {
+                    io.getOpenFile().getWriteStreamSafe().setSync(true);
+                } catch (BadDescriptorException e) {
+                    throw runtime.newErrnoEBADFError();
+                }
             }
 
             if (!value.respondsTo("write")) {

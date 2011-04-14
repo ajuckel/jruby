@@ -5,16 +5,17 @@ import java.util.Map;
 import org.jruby.compiler.ir.Operation;
 import org.jruby.compiler.ir.operands.Operand;
 import org.jruby.compiler.ir.operands.Variable;
-import org.jruby.compiler.ir.representations.InlinerInfo;
 
 // This is of the form:
 //   v = OP(arg, attribute_array); Ex: v = NOT(v1)
 
-public class OneOperandInstr extends Instr {
+public abstract class OneOperandInstr extends Instr {
     Operand argument;
 
     public OneOperandInstr(Operation op, Variable dest, Operand argument) {
         super(op, dest);
+
+        assert argument != null: "One operand instructions must have a non-null argument";
         
         this.argument = argument;
     }
@@ -34,9 +35,5 @@ public class OneOperandInstr extends Instr {
 
     public void simplifyOperands(Map<Operand, Operand> valueMap) {
         argument = argument.getSimplifiedOperand(valueMap);
-    }
-
-    public Instr cloneForInlining(InlinerInfo ii) {
-        return new OneOperandInstr(operation, ii.getRenamedVariable(result), argument.cloneForInlining(ii));
     }
 }

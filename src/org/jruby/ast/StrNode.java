@@ -43,16 +43,24 @@ import org.jruby.runtime.Block;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.util.ByteList;
+import org.jruby.util.StringSupport;
 
 /** 
  * Representing a simple String literal.
  */
 public class StrNode extends Node implements ILiteralNode {
     private final ByteList value;
+    private final int codeRange;
 
     public StrNode(ISourcePosition position, ByteList value) {
+        this(position, value, StringSupport.codeRangeScan(value.getEncoding(), value));
+    }
+
+    public StrNode(ISourcePosition position, ByteList value, int codeRange) {
         super(position);
+
         this.value = value;
+        this.codeRange = codeRange;
     }
 
     public StrNode(ISourcePosition position, StrNode head, StrNode tail) {
@@ -62,10 +70,12 @@ public class StrNode extends Node implements ILiteralNode {
         ByteList tailBL = tail.getValue();
 
         ByteList myValue = new ByteList(headBL.getRealSize() + tailBL.getRealSize());
+        myValue.setEncoding(headBL.getEncoding());
         myValue.append(headBL);
         myValue.append(tailBL);
 
         value = myValue;
+        codeRange = StringSupport.codeRangeScan(value.getEncoding(), value);
     }
 
     public NodeType getNodeType() {
@@ -86,6 +96,15 @@ public class StrNode extends Node implements ILiteralNode {
     public ByteList getValue() {
         return value;
     }
+
+    /**
+     * Get the string's coderange.
+     *
+     * @return the string's coderange
+     */
+    public int getCodeRange() {
+        return codeRange;
+    }
     
     public List<Node> childNodes() {
         return EMPTY_LIST;
@@ -93,6 +112,6 @@ public class StrNode extends Node implements ILiteralNode {
 
     @Override
     public IRubyObject interpret(Ruby runtime, ThreadContext context, IRubyObject self, Block aBlock) {
-        return RubyString.newStringShared(runtime, value);
+        return RubyString.newStringShared(runtime, value, codeRange);
     }
 }

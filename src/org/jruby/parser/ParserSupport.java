@@ -38,6 +38,7 @@ package org.jruby.parser;
 import java.math.BigInteger;
 import org.jruby.CompatVersion;
 import org.jruby.RubyBignum;
+import org.jruby.RubyRegexp;
 import org.jruby.ast.AliasNode;
 import org.jruby.ast.AndNode;
 import org.jruby.ast.ArgsPreOneArgNode;
@@ -174,6 +175,7 @@ import org.jruby.lexer.yacc.SyntaxException.PID;
 import org.jruby.runtime.DynamicScope;
 import org.jruby.util.ByteList;
 import org.jruby.util.IdUtil;
+import org.jruby.util.RegexpOptions;
 
 /** 
  *
@@ -192,7 +194,7 @@ public class ParserSupport {
 
     protected IRubyWarnings warnings;
 
-    private ParserConfiguration configuration;
+    protected ParserConfiguration configuration;
     private RubyParserResult result;
 
     public void reset() {
@@ -260,7 +262,7 @@ public class ParserSupport {
         case GLOBALASGNNODE:
             return new GlobalVarNode(node.getPosition(), ((INameNode) node).getName());
         }
-        
+
         getterIdentifierError(node.getPosition(), ((INameNode) node).getName());
         return null;
     }
@@ -282,7 +284,8 @@ public class ParserSupport {
         case Tokens.kFALSE:
             return new FalseNode(token.getPosition());
         case Tokens.k__FILE__:
-            return new FileNode(token.getPosition(), ByteList.create(token.getPosition().getFile()));
+            return new FileNode(token.getPosition(), new ByteList(token.getPosition().getFile().getBytes(),
+                    getConfiguration().getRuntime().getEncodingService().getLocaleEncoding()));
         case Tokens.k__LINE__:
             return new FixnumNode(token.getPosition(), token.getPosition().getStartLine()+1);
         case Tokens.k__ENCODING__:
@@ -627,8 +630,7 @@ public class ParserSupport {
     public boolean isLiteral(Node node) {
         return node != null && (node instanceof FixnumNode || node instanceof BignumNode || 
                 node instanceof FloatNode || node instanceof SymbolNode || 
-                (node instanceof RegexpNode && 
-                        (((RegexpNode) node).getOptions() & ~ReOptions.RE_OPTION_ONCE) == 0));
+                (node instanceof RegexpNode && ((RegexpNode) node).getOptions().toJoniOptions() == 0));
     }
 
     private void handleUselessWarn(Node node, String useless) {
@@ -1239,13 +1241,17 @@ public class ParserSupport {
     public void setLexer(RubyYaccLexer lexer) {
         this.lexer = lexer;
     }
+
+    public DStrNode createDStrNode(ISourcePosition position) {
+        return new DStrNode(position);
+    }
     
     public Node literal_concat(ISourcePosition position, Node head, Node tail) { 
         if (head == null) return tail;
         if (tail == null) return head;
         
         if (head instanceof EvStrNode) {
-            head = new DStrNode(head.getPosition()).add(head);
+            head = createDStrNode(head.getPosition()).add(head);
         } 
 
         if (tail instanceof StrNode) {
@@ -1276,9 +1282,9 @@ public class ParserSupport {
         	
             //Do not add an empty string node
             if(((StrNode) head).getValue().length() == 0) {
-                head = new DStrNode(head.getPosition());
+                head = createDStrNode(head.getPosition());
             } else {
-                head = new DStrNode(head.getPosition()).add(head);
+                head = createDStrNode(head.getPosition()).add(head);
             }
         }
         return ((DStrNode) head).add(tail);
@@ -1304,13 +1310,10 @@ public class ParserSupport {
     public IterNode new_iter(ISourcePosition position, Node vars, 
             StaticScope scope, Node body) {
         if (vars != null && vars instanceof BlockPassNode) {
-            BlockPassNode blockPass = (BlockPassNode) vars;
-
-            return new IterNode(position, blockPass.getArgsNode(), blockPass,
-                    scope, body);
+            vars = ((BlockPassNode)vars).getArgsNode();
         }
         
-        return new IterNode(position, vars, null, scope, body);
+        return new IterNode(position, vars, scope, body);
     }
     
     public Node new_yield(ISourcePosition position, Node node) {
@@ -1401,25 +1404,22 @@ public class ParserSupport {
         return (node == null) ? new NilNode(defaultPosition) : node; 
     }
 
-    public ArgumentNode getRestArgNode(Token token) {
-        int index = ((Integer) token.getValue()).intValue();
-        if(index < 0) {
-            return null;
-        }
-        String name = getCurrentScope().getLocalScope().getVariables()[index];
-
-        return new ArgumentNode(token.getPosition(), name);
-    }
-
     public Node new_args(ISourcePosition position, ListNode pre, ListNode optional, RestArgNode rest,
             ListNode post, BlockArgNode block) {
         // Zero-Argument declaration
         if (optional == null && rest == null && post == null && block == null) {
             if (pre == null || pre.size() == 0) return new ArgsNoArgNode(position);
-            if (pre.size() == 1) return new ArgsPreOneArgNode(position, pre);
-            if (pre.size() == 2) return new ArgsPreTwoArgNode(position, pre);
+            if (pre.size() == 1 && !hasAssignableArgs(pre)) return new ArgsPreOneArgNode(position, pre);
+            if (pre.size() == 2 && !hasAssignableArgs(pre)) return new ArgsPreTwoArgNode(position, pre);
         }
         return new ArgsNode(position, pre, optional, rest, post, block);
+    }
+
+    private boolean hasAssignableArgs(ListNode list) {
+        for (Node node : list.childNodes()) {
+            if (node instanceof AssignableNode) return true;
+        }
+        return false;
     }
 
     public Node newAlias(ISourcePosition position, Node newNode, Node oldNode) {
@@ -1480,7 +1480,7 @@ public class ParserSupport {
     public boolean is_local_id(Token identifier) {
         String name = (String) identifier.getValue();
 
-        return getCurrentScope().getLocalScope().isDefined(name) < 0;
+        return lexer.isIdentifierChar(name.charAt(0));
     }
 
     // 1.9
@@ -1497,23 +1497,54 @@ public class ParserSupport {
             getterIdentifierError(identifier.getPosition(), (String) identifier.getValue());
         }
         shadowing_lvar(identifier);
-        arg_var(identifier);
-
-        return null;
+        
+        return arg_var(identifier);
     }
 
     // 1.9
-    public int arg_var(Token identifier) {
-        return getCurrentScope().addVariableThisScope((String) identifier.getValue());
+    public ArgumentNode arg_var(Token identifier) {
+        String name = (String) identifier.getValue();
+        StaticScope current = getCurrentScope();
+
+        // Multiple _ arguments are allowed.  To not screw with tons of arity
+        // issues in our runtime we will allocate unnamed bogus vars so things
+        // still work. MRI does not use name as intern'd value so they don't
+        // have this issue.
+        if (name == "_") {
+            int count = 0;
+            while (current.exists(name) >= 0) {
+                name = "_$" + count++;
+            }
+        }
+        return new ArgumentNode(identifier.getPosition(), name,
+                getCurrentScope().addVariableThisScope(name));
+    }
+
+    public Token formal_argument(Token identifier) {
+        if (!is_local_id(identifier)) yyerror("formal argument must be local variable");
+
+        return shadowing_lvar(identifier);
     }
 
     // 1.9
-    public void shadowing_lvar(Token identifier) {
+    public Token shadowing_lvar(Token identifier) {
         String name = (String) identifier.getValue();
 
-        if (getCurrentScope().isDefined(name) > 0) {
-            if (warnings.isVerbose()) warnings.warning(ID.STATEMENT_NOT_REACHED, identifier.getPosition(), "shadowing outer local variable - " + name);
+        if (name == "_") return identifier;
+
+        StaticScope current = getCurrentScope();
+        if (current instanceof BlockStaticScope) {
+            if (current.exists(name) >= 0) yyerror("duplicated argument name");
+
+            if (warnings.isVerbose() && current.isDefined(name) >= 0) {
+                warnings.warning(ID.STATEMENT_NOT_REACHED, identifier.getPosition(),
+                        "shadowing outer local variable - " + name);
+            }
+        } else if (current.exists(name) >= 0) {
+            yyerror("duplicated argument name");
         }
+
+        return identifier;
     }
 
     // 1.9
@@ -1557,4 +1588,40 @@ public class ParserSupport {
         return new ArgsPushNode(position(node1, node2), node1, node2);
     }
 
+    public void regexpFragmentCheck(RegexpNode end, ByteList value) {
+        // 1.9 mode overrides to do extra checking...
+    }
+
+    protected void checkRegexpSyntax(ByteList value, RegexpOptions options) {
+        RubyRegexp.newRegexp(getConfiguration().getRuntime(), value, options);
+    }
+
+    public Node newRegexpNode(ISourcePosition position, Node contents, RegexpNode end) {
+        RegexpOptions options = end.getOptions();
+        boolean is19 = !lexer.isOneEight();
+
+        if (contents == null) {
+            ByteList newValue = ByteList.create("");
+            regexpFragmentCheck(end, newValue);
+            return new RegexpNode(position, newValue, options.withoutOnce());
+        } else if (contents instanceof StrNode) {
+            ByteList meat = (ByteList) ((StrNode) contents).getValue().clone();
+            regexpFragmentCheck(end, meat);
+            checkRegexpSyntax(meat, options.withoutOnce());
+            return new RegexpNode(contents.getPosition(), meat, options.withoutOnce());
+        } else if (contents instanceof DStrNode) {
+            DStrNode dStrNode = (DStrNode) contents;
+
+            for (Node fragment: dStrNode.childNodes()) {
+                if (fragment instanceof StrNode) {
+                    regexpFragmentCheck(end, ((StrNode) fragment).getValue());
+                }
+            }
+            
+            return new DRegexpNode(position, options, is19).addAll((DStrNode) contents);
+        }
+
+        // No encoding or fragment check stuff for this...but what case is this anyways?
+        return new DRegexpNode(position, options, is19).add(contents);
+    }
 }

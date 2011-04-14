@@ -29,7 +29,6 @@
  ***** END LICENSE BLOCK *****/
 package org.jruby.runtime;
 
-import org.jruby.runtime.callsite.DivCallSite;
 import org.jruby.runtime.callsite.LtCallSite;
 import org.jruby.runtime.callsite.LeCallSite;
 import org.jruby.runtime.callsite.MinusCallSite;
@@ -38,18 +37,18 @@ import org.jruby.runtime.callsite.NormalCachingCallSite;
 import org.jruby.runtime.callsite.GtCallSite;
 import org.jruby.runtime.callsite.PlusCallSite;
 import org.jruby.runtime.callsite.GeCallSite;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import org.jruby.RubyInstanceConfig;
-import org.jruby.runtime.callsite.ArefCallSite;
-import org.jruby.runtime.callsite.AsetCallSite;
+import org.jruby.runtime.callsite.CmpCallSite;
+import org.jruby.runtime.callsite.EqCallSite;
+import org.jruby.runtime.callsite.BitAndCallSite;
+import org.jruby.runtime.callsite.BitOrCallSite;
 import org.jruby.runtime.callsite.FunctionalCachingCallSite;
-import org.jruby.runtime.callsite.ModCallSite;
 import org.jruby.runtime.callsite.RespondToCallSite;
+import org.jruby.runtime.callsite.ShiftLeftCallSite;
+import org.jruby.runtime.callsite.ShiftRightCallSite;
 import org.jruby.runtime.callsite.SuperCallSite;
 import org.jruby.runtime.callsite.VariableCachingCallSite;
+import org.jruby.runtime.callsite.XorCallSite;
 
 /**
  *
@@ -60,15 +59,43 @@ public class MethodIndex {
     public static final int OP_EQUAL = 1;
     public static final int EQL = 2;
     public static final int HASH = 3;
-    public static final int MAX_METHODS = 4;
+    public static final int OP_CMP = 4;
+    public static final int MAX_METHODS = 5;
+    
+    public static final String[] METHOD_NAMES = {
+        "",
+        "==",
+        "eql?",
+        "hash",
+        "<=>"
+    };
 
     public static CallSite getCallSite(String name) {
         // fast and safe respond_to? call site logic
         if (name.equals("respond_to?")) return new RespondToCallSite();
-        
-        if (RubyInstanceConfig.FASTOPS_COMPILE_ENABLED) return getFastOpsCallSite(name);
+
+        // only use fast ops if we're not tracing
+        if (RubyInstanceConfig.FASTOPS_COMPILE_ENABLED &&
+                !(RubyInstanceConfig.FULL_TRACE_ENABLED)) return getFastOpsCallSite(name);
 
         return new NormalCachingCallSite(name);
+    }
+    
+    public static boolean hasFastOps(String name) {
+        return name.equals("+")
+                || name.equals("-")
+                || name.equals("*")
+                || name.equals("<")
+                || name.equals("<=")
+                || name.equals(">")
+                || name.equals(">=")
+                || name.equals("==")
+                || name.equals("<=>")
+                || name.equals("&")
+                || name.equals("|")
+                || name.equals("^")
+                || name.equals(">>")
+                || name.equals("<<");
     }
 
     public static CallSite getFastOpsCallSite(String name) {
@@ -86,12 +113,28 @@ public class MethodIndex {
             return new GtCallSite();
         } else if (name.equals(">=")) {
             return new GeCallSite();
-        } else if (name.equals("[]")) {
-            return new ArefCallSite();
-        } else if (name.equals("[]=")) {
-            return new AsetCallSite();
-        } else if (name.equals("%")) {
-            return new ModCallSite();
+        } else if (name.equals("==")) {
+            return new EqCallSite();
+        } else if (name.equals("<=>")) {
+            return new CmpCallSite();
+        } else if (name.equals("&")) {
+            return new BitAndCallSite();
+        } else if (name.equals("|")) {
+            return new BitOrCallSite();
+        } else if (name.equals("^")) {
+            return new XorCallSite();
+        } else if (name.equals(">>")) {
+            return new ShiftRightCallSite();
+        } else if (name.equals("<<")) {
+            return new ShiftLeftCallSite();
+        // disabled because Array subclasses often override
+//        } else if (name.equals("[]")) {
+//            return new ArefCallSite();
+//        } else if (name.equals("[]=")) {
+//            return new AsetCallSite();
+        // disabled because of differing 1.8/1.9 behavior
+//        } else if (name.equals("%")) {
+//            return new ModCallSite();
         }
 
         return new NormalCachingCallSite(name);

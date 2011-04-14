@@ -56,7 +56,6 @@ import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.Locale;
 
-import java.util.regex.Pattern;
 import org.jcodings.specific.ASCIIEncoding;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
@@ -69,6 +68,9 @@ import org.jruby.runtime.marshal.UnmarshalStream;
 import org.jruby.util.ByteList;
 import org.jruby.util.ConvertDouble;
 import org.jruby.util.Sprintf;
+
+import static org.jruby.javasupport.util.RuntimeHelpers.invokedynamic;
+import static org.jruby.runtime.MethodIndex.OP_EQUAL;
 
 /**
   * A representation of a float object
@@ -768,7 +770,7 @@ public class RubyFloat extends RubyNumeric {
                     f_lshift(context, one, f_sub(context,one,rn)));
         }
 
-        if (a.callMethod(context, "==", b).isTrue()) return f_to_r(context, this);
+        if (invokedynamic(context, a, OP_EQUAL, b).isTrue()) return f_to_r(context, this);
 
         IRubyObject[] ary = new IRubyObject[2];
         ary[0] = a;
@@ -803,6 +805,40 @@ public class RubyFloat extends RubyNumeric {
     @JRubyMethod(name = "round")
     @Override
     public IRubyObject round() {
+        return dbl2num(getRuntime(), val2dbl());
+    }
+    
+    @JRubyMethod(name = "round", optional = 1, compat = CompatVersion.RUBY1_9)
+    public IRubyObject round(ThreadContext context, IRubyObject[] args) {
+        if (args.length == 0) return round();
+        double digits = num2dbl(args[0]);
+        double magnifier = Math.pow(10.0, Math.abs(digits));
+        double number = value;
+        
+        if (Double.isInfinite(magnifier)) {
+            if (digits < 0) number = 0;
+        } else {
+            if (digits < 0) {
+                number /= magnifier;
+            } else {
+                number *= magnifier;
+            }
+            number = Math.round(number);
+            if (digits < 0) {
+                number *= magnifier;
+            } else {
+                number /= magnifier;
+            }
+        }
+        
+        if (digits > 0) {
+            return RubyFloat.newFloat(context.getRuntime(), number);
+        } else {
+            return dbl2num(context.getRuntime(), (long)number);
+        }
+    }
+    
+    private double val2dbl() {
         double f = value;
         if (f > 0.0) {
             f = Math.floor(f);
@@ -815,7 +851,8 @@ public class RubyFloat extends RubyNumeric {
                 f -= 1.0;
             }
         }
-        return dbl2num(getRuntime(), f);
+        
+        return f;
     }
         
     /** flo_is_nan_p
@@ -848,20 +885,17 @@ public class RubyFloat extends RubyNumeric {
         return getRuntime().getTrue();
     }
 
-    // CRuby uses sprintf(buf, "%.*g", FLOAT_DIG, d);
-    // This pattern adjusts the output of String.pattern("%g") to mimic
-    // the C version.
-    private static final Pattern pattern = Pattern.compile("\\.?0+(e|$)");
-
-    private static String formatDouble(double x) {
-        return pattern.matcher(String.format("%.32g", x)).replaceFirst("$1");
+    private static ByteList formatDouble(RubyFloat x) {
+        ByteList byteList = new ByteList();
+        Sprintf.sprintf(byteList, "%.17g", RubyArray.newArray(x.getRuntime(), x, x));
+        return byteList;
     }
 
-    private String marshalDump() {
-        if (Double.isInfinite(value)) return value < 0 ? "-inf" : "inf";
-        if (Double.isNaN(value)) return "nan";
+    private ByteList marshalDump() {
+        if (Double.isInfinite(value)) return value < 0 ? NEGATIVE_INFINITY_BYTELIST : INFINITY_BYTELIST;
+        if (Double.isNaN(value)) return NAN_BYTELIST;
 
-        return formatDouble(value);
+        return formatDouble(this);
     }
 
     public static void marshalTo(RubyFloat aFloat, MarshalStream output) throws java.io.IOException {

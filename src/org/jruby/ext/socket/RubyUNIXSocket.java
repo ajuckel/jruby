@@ -68,6 +68,7 @@ import org.jruby.util.io.ChannelDescriptor;
 import org.jruby.util.io.ChannelStream;
 import org.jruby.util.io.ModeFlags;
 import org.jruby.util.ByteList;
+import org.jruby.util.io.BadDescriptorException;
 import org.jruby.util.io.InvalidValueException;
 
 /**
@@ -359,9 +360,11 @@ public class RubyUNIXSocket extends RubyBasicSocket {
         try {
             ModeFlags modes = new ModeFlags(ModeFlags.RDWR);
             openFile.setMainStream(ChannelStream.open(runtime, new ChannelDescriptor(new UnixDomainSocketChannel(runtime, fd), modes)));
-            openFile.setPipeStream(openFile.getMainStream());
+            openFile.setPipeStream(openFile.getMainStreamSafe());
             openFile.setMode(modes.getOpenFileFlags());
-            openFile.getMainStream().setSync(true);
+            openFile.getMainStreamSafe().setSync(true);
+        } catch (BadDescriptorException e) {
+            throw runtime.newErrnoEBADFError();
         } catch (InvalidValueException ive) {
             throw runtime.newErrnoEINVALError();
         }
@@ -435,7 +438,7 @@ public class RubyUNIXSocket extends RubyBasicSocket {
 
     @JRubyMethod(name = "recvfrom", required = 1, optional = 1)
     public IRubyObject recvfrom(ThreadContext context, IRubyObject[] args) {
-        ByteBuffer str = ByteBuffer.allocateDirect(1024);
+        
         LibCSocket.sockaddr_un buf = LibCSocket.sockaddr_un.newInstance();
         IntByReference alen = new IntByReference(LibCSocket.sockaddr_un.LENGTH);
 
@@ -458,6 +461,9 @@ public class RubyUNIXSocket extends RubyBasicSocket {
         }
 
         int buflen = RubyNumeric.fix2int(len);
+        byte[] tmpbuf = new byte[buflen];
+        ByteBuffer str = ByteBuffer.wrap(tmpbuf);
+
         int slen = INSTANCE.recvfrom(fd, str, buflen, flags, buf, alen);
         if(slen < 0) {
             rb_sys_fail(context.getRuntime(), "recvfrom(2)");
@@ -466,9 +472,8 @@ public class RubyUNIXSocket extends RubyBasicSocket {
         if(slen < buflen) {
             buflen = slen;
         }
-        byte[] outp = new byte[buflen];
-        str.get(outp);
-        RubyString _str = context.getRuntime().newString(new ByteList(outp, 0, buflen, false));
+
+        RubyString _str = context.getRuntime().newString(new ByteList(tmpbuf, 0, buflen, true));
 
         return context.getRuntime().newArrayNoCopy(new IRubyObject[]{_str, unixaddr(context.getRuntime(), buf, alen)});
     }

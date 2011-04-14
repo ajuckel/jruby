@@ -8,6 +8,7 @@ import org.jruby.RubyModule;
 import org.jruby.RubyObject;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
+import org.jruby.embed.util.SystemPropertyCatcher;
 import org.jruby.exceptions.RaiseException;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ThreadContext;
@@ -140,6 +141,21 @@ public class Struct extends RubyObject implements StructLayout.Storage {
         return this;
     }
 
+    @JRubyMethod(name = "initialize_copy")
+    public IRubyObject initialize_copy(ThreadContext context, IRubyObject other) {
+        if (other == this) {
+            return this;
+        }
+        if (!(other instanceof Struct)) {
+            throw context.getRuntime().newTypeError("not an instance of Struct");
+        }
+        Struct orig = (Struct) other;
+        memory = (AbstractMemory) orig.getMemory().slice(context.getRuntime(), 0, layout.getSize()).dup();
+        System.arraycopy(orig.referenceCache, 0, referenceCache, 0, referenceCache.length);
+        return this;
+    }
+
+
     private static final Struct allocateStruct(ThreadContext context, IRubyObject klass, int flags) {
         Ruby runtime = context.getRuntime();
         StructLayout layout = getStructLayout(runtime, klass);
@@ -212,7 +228,7 @@ public class Struct extends RubyObject implements StructLayout.Storage {
     public final IRubyObject order(ThreadContext context, IRubyObject byte_order) {
         ByteOrder order = Util.parseByteOrder(context.getRuntime(), byte_order);
         return new Struct(context.getRuntime(), getMetaClass(), layout,
-                getMemory().order(context.getRuntime(), Util.parseByteOrder(context.getRuntime(), byte_order)));
+                getMemory().order(context.getRuntime(), order));
     }
 
     public final AbstractMemory getMemory() {

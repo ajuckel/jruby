@@ -48,7 +48,6 @@ import org.jruby.embed.util.SystemPropertyCatcher;
  * @author Yoko Harada <yokolet@gmail.com>
  */
 public class JRubyEngineFactory implements ScriptEngineFactory {
-    private ScriptingContainer container = null;
     private final String engineName;
     private final String engineVersion;
     private final List<String> extensions;
@@ -66,6 +65,7 @@ public class JRubyEngineFactory implements ScriptEngineFactory {
         engineVersion = org.jruby.runtime.Constants.VERSION;
         extensions = Collections.unmodifiableList(Arrays.asList(new String[]{"rb"}));
         languageName = "ruby";
+        languageVersion = "jruby " + org.jruby.runtime.Constants.VERSION;
         mimeTypes = Collections.unmodifiableList(Arrays.asList(new String[]{"application/x-ruby"}));
         engineIds = Collections.unmodifiableList(Arrays.asList(new String[]{"ruby", "jruby"}));
         // does followings on demand to avoid runtime initialization
@@ -99,12 +99,6 @@ public class JRubyEngineFactory implements ScriptEngineFactory {
     }
 
     public String getLanguageVersion() {
-        if (languageVersion == null) {
-            if (container == null) {
-                getScriptEngine();
-            }
-            languageVersion = container.getSupportedRubyVersion();
-        }
         return languageVersion;
     }
 
@@ -173,8 +167,8 @@ public class JRubyEngineFactory implements ScriptEngineFactory {
     public ScriptEngine getScriptEngine() {
         LocalContextScope scope = SystemPropertyCatcher.getScope(LocalContextScope.SINGLETON);
         LocalVariableBehavior behavior = SystemPropertyCatcher.getBehavior(LocalVariableBehavior.GLOBAL);
-        boolean lazy = SystemPropertyCatcher.isLazy(true);
-        container = new ScriptingContainer(scope, behavior, lazy);
+        boolean lazy = SystemPropertyCatcher.isLazy(false);
+        ScriptingContainer container = new ScriptingContainer(scope, behavior, lazy);
         if( classLoader != null ) {
             container.setClassLoader(classLoader);
         }

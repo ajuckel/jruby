@@ -92,11 +92,11 @@ public class JRubyEngine implements Compilable, Invocable, ScriptEngine {
         } catch (Exception e) {
             throw wrapException(e);
         } finally {
+            Utils.postEval(container, tmpContext);
+            if (tmpContext != context) JRubyContext.update(tmpContext, context);
             if(Utils.isTerminationOn(tmpContext)) {
                 container.terminate();
             }
-            Utils.postEval(container, tmpContext);
-            if (tmpContext != context) JRubyContext.update(tmpContext, context);
         }
     }
 
@@ -132,11 +132,11 @@ public class JRubyEngine implements Compilable, Invocable, ScriptEngine {
         } catch (Exception e) {
             throw wrapException(e);
         } finally {
+            Utils.postEval(container, tmpContext);
+            if (tmpContext != context) JRubyContext.update(tmpContext, context);
             if(Utils.isTerminationOn(tmpContext)) {
                 container.terminate();
             }
-            Utils.postEval(container, tmpContext);
-            if (tmpContext != context) JRubyContext.update(tmpContext, context);
         }
     }
 
@@ -243,10 +243,10 @@ public class JRubyEngine implements Compilable, Invocable, ScriptEngine {
             try {
                 w.write(e.getMessage());
             } catch (IOException ex) {
-                return new NoSuchMethodException(ex.getMessage());
+                return (NoSuchMethodException)new NoSuchMethodException(ex.getMessage()).initCause(ex);
             }
         }
-        return new NoSuchMethodException(e.getCause().getMessage());
+        return (NoSuchMethodException)new NoSuchMethodException(e.getCause().getMessage()).initCause(e);
     }
 
     public Object invokeFunction(String method, Object... args)

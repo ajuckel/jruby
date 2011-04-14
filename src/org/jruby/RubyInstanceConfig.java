@@ -11,7 +11,7 @@
  * implied. See the License for the specific language governing
  * rights and limitations under the License.
  *
- * Copyright (C) 2007-2010 Nick Sieger <nicksieger@gmail.com>
+ * Copyright (C) 2007-2011 Nick Sieger <nicksieger@gmail.com>
  * Copyright (C) 2009 Joseph LaFata <joe@quibb.org>
  *
  * Alternatively, the contents of this file may be used under the terms of
@@ -36,9 +36,10 @@ import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.PrintStream;
-import java.net.URI;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -55,8 +56,14 @@ import org.jruby.ast.executable.Script;
 import org.jruby.compiler.ASTCompiler;
 import org.jruby.compiler.ASTCompiler19;
 import org.jruby.exceptions.MainExitException;
+import org.jruby.embed.util.SystemPropertyCatcher;
 import org.jruby.ext.posix.util.Platform;
 import org.jruby.runtime.Constants;
+import org.jruby.runtime.backtrace.TraceType;
+import org.jruby.runtime.profile.IProfileData;
+import org.jruby.runtime.profile.AbstractProfilePrinter;
+import org.jruby.runtime.profile.FlatProfilePrinter;
+import org.jruby.runtime.profile.GraphProfilePrinter;
 import org.jruby.runtime.load.LoadService;
 import org.jruby.runtime.load.LoadService19;
 import org.jruby.util.ClassCache;
@@ -76,7 +83,7 @@ public class RubyInstanceConfig {
     /**
      * The max size of JIT-compiled methods (full class size) allowed.
      */
-    public static final int JIT_MAX_SIZE_LIMIT = 10000;
+    public static final int JIT_MAX_SIZE_LIMIT = 30000;
 
     /**
      * The JIT threshold to the specified method invocation count.
@@ -157,6 +164,8 @@ public class RubyInstanceConfig {
     private CompileMode compileMode = CompileMode.JIT;
     private boolean runRubyInProcess   = true;
     private String currentDirectory;
+
+    /** Environment variables; defaults to System.getenv() in constructor */
     private Map environment;
     private String[] argv = {};
 
@@ -169,8 +178,16 @@ public class RubyInstanceConfig {
     private int jitMaxSize;
     private final boolean samplingEnabled;
     private CompatVersion compatVersion;
-    private boolean profiling;
 
+    private String internalEncoding = null;
+    private String externalEncoding = null;
+
+    public enum ProfilingMode {
+		OFF, API, FLAT, GRAPH
+	}
+		
+    private ProfilingMode profilingMode = ProfilingMode.OFF;
+    
     private ClassLoader contextLoader = Thread.currentThread().getContextClassLoader();
     private ClassLoader loader = contextLoader == null ? RubyInstanceConfig.class.getClassLoader() : contextLoader;
 
@@ -209,10 +226,13 @@ public class RubyInstanceConfig {
     private boolean parserDebug = false;
     private String threadDumpSignal = null;
     private boolean hardExit = false;
+    private boolean disableGems = false;
 
     private int safeLevel = 0;
 
     private String jrubyHome;
+    
+    private static volatile boolean loadedNativeExtensions = false;
 
     public static final boolean PEEPHOLE_OPTZ
             = SafePropertyAccessor.getBoolean("jruby.compile.peephole", true);
@@ -224,18 +244,10 @@ public class RubyInstanceConfig {
             = SafePropertyAccessor.getBoolean("jruby.compile.fastest");
     public static boolean FASTOPS_COMPILE_ENABLED
             = FASTEST_COMPILE_ENABLED
-            || SafePropertyAccessor.getBoolean("jruby.compile.fastops");
-    public static boolean FRAMELESS_COMPILE_ENABLED
-            = FASTEST_COMPILE_ENABLED
-            || SafePropertyAccessor.getBoolean("jruby.compile.frameless");
-    public static boolean POSITIONLESS_COMPILE_ENABLED
-            = FASTEST_COMPILE_ENABLED
-            || SafePropertyAccessor.getBoolean("jruby.compile.positionless", true);
+            || SafePropertyAccessor.getBoolean("jruby.compile.fastops", true);
     public static boolean THREADLESS_COMPILE_ENABLED
             = FASTEST_COMPILE_ENABLED
             || SafePropertyAccessor.getBoolean("jruby.compile.threadless");
-    public static boolean FASTCASE_COMPILE_ENABLED =
-            SafePropertyAccessor.getBoolean("jruby.compile.fastcase");
     public static boolean FASTSEND_COMPILE_ENABLED
             = FASTEST_COMPILE_ENABLED
             || SafePropertyAccessor.getBoolean("jruby.compile.fastsend");
@@ -243,8 +255,6 @@ public class RubyInstanceConfig {
     public static boolean INLINE_DYNCALL_ENABLED
             = FASTEST_COMPILE_ENABLED
             || SafePropertyAccessor.getBoolean("jruby.compile.inlineDyncalls");
-    public static final boolean FORK_ENABLED
-            = SafePropertyAccessor.getBoolean("jruby.fork.enabled");
     public static final boolean POOLING_ENABLED
             = SafePropertyAccessor.getBoolean("jruby.thread.pool.enabled");
     public static final int POOL_MAX
@@ -308,6 +318,12 @@ public class RubyInstanceConfig {
 
     public static final boolean CAN_SET_ACCESSIBLE = SafePropertyAccessor.getBoolean("jruby.ji.setAccessible", true);
 
+    private TraceType traceType =
+            TraceType.traceTypeFor(SafePropertyAccessor.getProperty("jruby.backtrace.style", "ruby_framed"));
+    
+    public static final boolean ERRNO_BACKTRACE
+            = SafePropertyAccessor.getBoolean("jruby.errno.backtrace", false);
+
     public static interface LoadServiceCreator {
         LoadService create(Ruby runtime);
 
@@ -366,6 +382,12 @@ public class RubyInstanceConfig {
         threadDumpSignal = parentConfig.threadDumpSignal;
         
         classCache = new ClassCache<Script>(loader, jitMax);
+
+        try {
+            environment = System.getenv();
+        } catch (SecurityException se) {
+            environment = new HashMap();
+        }
     }
 
     public RubyInstanceConfig() {
@@ -439,8 +461,10 @@ public class RubyInstanceConfig {
         classCache = new ClassCache<Script>(loader, jitMax);
         threadDumpSignal = SafePropertyAccessor.getProperty("jruby.thread.dump.signal", "USR2");
 
-        if (FORK_ENABLED) {
-            error.print("WARNING: fork is highly unlikely to be safe or stable on the JVM. Have fun!\n");
+        try {
+            environment = System.getenv();
+        } catch (SecurityException se) {
+            environment = new HashMap();
         }
     }
 
@@ -467,13 +491,15 @@ public class RubyInstanceConfig {
                 .append("  -Cdirectory     cd to directory, before executing your script\n")
                 .append("  -d              set debugging flags (set $DEBUG to true)\n")
                 .append("  -e 'command'    one line of script. Several -e's allowed. Omit [programfile]\n")
+                .append("  -Eex[:in]       specify the default external and internal character encodings\n")
                 .append("  -Fpattern       split() pattern for autosplit (-a)\n")
                 .append("  -i[extension]   edit ARGV files in place (make backup if extension supplied)\n")
                 .append("  -Idirectory     specify $LOAD_PATH directory (may be used more than once)\n")
                 .append("  -J[java option] pass an option on to the JVM (e.g. -J-Xmx512m)\n")
                 .append("                    use --properties to list JRuby properties\n")
                 .append("                    run 'java -help' for a list of other Java options\n")
-                .append("  -Kkcode         specifies code-set (e.g. -Ku for Unicode, -Ke for EUC and -Ks for SJIS)\n")
+                .append("  -Kkcode         specifies code-set (e.g. -Ku for Unicode, -Ke for EUC and -Ks\n")
+                .append("                    for SJIS)\n")
                 .append("  -l              enable line ending processing\n")
                 .append("  -n              assume 'while gets(); ... end' loop around your script\n")
                 .append("  -p              assume loop like -n but print line also like sed\n")
@@ -481,6 +507,7 @@ public class RubyInstanceConfig {
                 .append("  -s              enable some switch parsing for switches after script name\n")
                 .append("  -S              look for the script in bin or using PATH environment variable\n")
                 .append("  -T[level]       turn on tainting checks\n")
+                .append("  -U              use UTF-8 as default internal encoding\n")
                 .append("  -v              print version number, then turn on verbose mode\n")
                 .append("  -w              turn warnings on for your script\n")
                 .append("  -W[level]       set warning level; 0=silence, 1=medium, 2=verbose (default)\n")
@@ -488,14 +515,21 @@ public class RubyInstanceConfig {
                 .append("  -X[option]      enable extended option (omit option to list)\n")
                 .append("  -y              enable parsing debug output\n")
                 .append("  --copyright     print the copyright\n")
-                .append("  --debug         sets the execution mode most suitable for debugger functionality\n")
+                .append("  --debug         sets the execution mode most suitable for debugger\n")
+                .append("                    functionality\n")
                 .append("  --jdb           runs JRuby process under JDB\n")
-                .append("  --properties    List all configuration Java properties (pass -J-Dproperty=value)\n")
+                .append("  --properties    List all configuration Java properties\n")
+                .append("                    (pass -X<property without \"jruby.\">=value to set them)\n")
                 .append("  --sample        run with profiling using the JVM's sampling profiler\n")
-                .append("  --profile       run with instrumented (timed) profiling\n")
-                .append("  --client        use the non-optimizing \"client\" JVM (improves startup; default)\n")
+                .append("  --profile       run with instrumented (timed) profiling, flat format\n")
+                .append("  --profile.api   activate Ruby profiler API\n")
+                .append("  --profile.flat  synonym for --profile\n")
+                .append("  --profile.graph run with instrumented (timed) profiling, graph format\n")
+                .append("  --client        use the non-optimizing \"client\" JVM\n")
+                .append("                    (improves startup; default)\n")
                 .append("  --server        use the optimizing \"server\" JVM (improves perf)\n")
-                .append("  --manage        enable remote JMX management and monitoring of the VM and JRuby\n")
+                .append("  --manage        enable remote JMX management and monitoring of the VM\n")
+                .append("                    and JRuby\n")
                 .append("  --headless      do not launch a GUI window, no matter what\n")
                 .append("  --1.8           specify Ruby 1.8.x compatibility (default)\n")
                 .append("  --1.9           specify Ruby 1.9.x compatibility\n")
@@ -508,12 +542,11 @@ public class RubyInstanceConfig {
     public String getExtendedHelp() {
         StringBuilder sb = new StringBuilder();
         sb
-                .append("These flags are for extended JRuby options.\n")
-                .append("Specify them by passing -X<option>\n")
-                .append("  -O              run with ObjectSpace disabled (default; improves performance)\n")
-                .append("  +O              run with ObjectSpace enabled (reduces performance)\n")
-                .append("  -C              disable all compilation\n")
-                .append("  +C              force compilation of all scripts before they are run (except eval)\n");
+                .append("Extended options:\n")
+                .append("  -X-O        run with ObjectSpace disabled (default; improves performance)\n")
+                .append("  -X+O        run with ObjectSpace enabled (reduces performance)\n")
+                .append("  -X-C        disable all compilation\n")
+                .append("  -X+C        force compilation of all scripts before they are run (except eval)\n");
 
         return sb.toString();
     }
@@ -526,18 +559,12 @@ public class RubyInstanceConfig {
                 .append("\nCOMPILER SETTINGS:\n")
                 .append("    jruby.compile.mode=JIT|FORCE|OFF\n")
                 .append("       Set compilation mode. JIT is default; FORCE compiles all, OFF disables\n")
-                .append("    jruby.compile.fastest=true|false\n")
-                .append("       (EXPERIMENTAL) Turn on all experimental compiler optimizations\n")
-                .append("    jruby.compile.frameless=true|false\n")
-                .append("       (EXPERIMENTAL) Turn on frameless compilation where possible\n")
-                .append("    jruby.compile.positionless=true|false\n")
-                .append("       (EXPERIMENTAL) Turn on compilation that avoids updating Ruby position info. Default is false\n")
                 .append("    jruby.compile.threadless=true|false\n")
                 .append("       (EXPERIMENTAL) Turn on compilation without polling for \"unsafe\" thread events. Default is false\n")
+                .append("    jruby.compile.dynopt=true|false\n")
+                .append("       (EXPERIMENTAL) Use interpreter to help compiler make direct calls. Default is false\n")
                 .append("    jruby.compile.fastops=true|false\n")
-                .append("       (EXPERIMENTAL) Turn on fast operators for Fixnum. Default is false\n")
-                .append("    jruby.compile.fastcase=true|false\n")
-                .append("       (EXPERIMENTAL) Turn on fast case/when for all-Fixnum whens. Default is false\n")
+                .append("       Turn on fast operators for Fixnum and Float. Default is true\n")
                 .append("    jruby.compile.chainsize=<line count>\n")
                 .append("       Set the number of lines at which compiled bodies are \"chained\". Default is ").append(CHAINED_COMPILE_LINE_COUNT_DEFAULT).append("\n")
                 .append("    jruby.compile.lazyHandles=true|false\n")
@@ -612,6 +639,8 @@ public class RubyInstanceConfig {
                 .append("       Print which script is executed by '-S' flag. Default is false.\n")
                 .append("    jruby.reflected.handles=true|false\n")
                 .append("       Use reflection for binding methods, not generated bytecode. Default is false.\n")
+                .append("    jruby.errno.backtrace=true|false\n")
+                .append("       Generate backtraces for heavily-used Errno exceptions (EAGAIN). Default is false.\n")
                 .append("\nJAVA INTEGRATION:\n")
                 .append("    jruby.ji.setAccessible=true|false\n")
                 .append("       Try to set inaccessible Java methods to be accessible. Default is true.\n")
@@ -623,23 +652,21 @@ public class RubyInstanceConfig {
 
     public String getVersionString() {
         String ver = null;
-        String patchDelimeter = null;
+        String patchDelimeter = "-p";
         int patchlevel = 0;
         switch (getCompatVersion()) {
         case RUBY1_8:
             ver = Constants.RUBY_VERSION;
             patchlevel = Constants.RUBY_PATCHLEVEL;
-            patchDelimeter = " patchlevel ";
             break;
         case RUBY1_9:
             ver = Constants.RUBY1_9_VERSION;
             patchlevel = Constants.RUBY1_9_PATCHLEVEL;
-            patchDelimeter = " trunk ";
             break;
         }
 
         String fullVersion = String.format(
-                "jruby %s (ruby %s%s%d) (%s %s) (%s %s) [%s-%s-java]",
+                "jruby %s (ruby-%s%s%d) (%s %s) (%s %s) [%s-%s-java]",
                 Constants.VERSION, ver, patchDelimeter, patchlevel,
                 Constants.COMPILE_DATE, Constants.REVISION,
                 System.getProperty("java.vm.name"), System.getProperty("java.version"),
@@ -651,7 +678,7 @@ public class RubyInstanceConfig {
     }
 
     public String getCopyrightString() {
-        return "JRuby - Copyright (C) 2001-2010 The JRuby Community (and contribs)";
+        return "JRuby - Copyright (C) 2001-2011 The JRuby Community (and contribs)";
     }
 
     public void processArguments(String[] arguments) {
@@ -661,19 +688,94 @@ public class RubyInstanceConfig {
 
     public void tryProcessArgumentsWithRubyopts() {
         try {
-            String rubyopt = null;
-            if (environment != null && environment.containsKey("RUBYOPT")) {
-                rubyopt = environment.get("RUBYOPT").toString();
-            } else {
-                rubyopt = System.getenv("RUBYOPT");
-            }
-            if (rubyopt != null && rubyopt.split("\\s").length != 0) {
+            // environment defaults to System.getenv normally
+            Object rubyoptObj = environment.get("RUBYOPT");
+            String rubyopt = rubyoptObj == null ? null : rubyoptObj.toString();
+            
+            if (rubyopt == null || "".equals(rubyopt)) return;
+
+            if (rubyopt.split("\\s").length != 0) {
                 String[] rubyoptArgs = rubyopt.split("\\s+");
+                endOfArguments = false;
                 new ArgumentProcessor(rubyoptArgs, false, true).processArguments();
             }
         } catch (SecurityException se) {
             // ignore and do nothing
         }
+    }
+
+    /**
+     * The intent here is to gather up any options that might have
+     * been specified in the shebang line and return them so they can
+     * be merged into the ones specified on the commandline.  This is
+     * kind of a hopeless task because it's impossible to figure out
+     * where the command invocation stops and the parameters start.
+     * We try to work with the common scenarios where /usr/bin/env is
+     * used to invoke the jruby shell script, and skip any parameters
+     * it might have.  Then we look for the interpreter invokation and
+     * assume that the binary will have the word "ruby" in the name.
+     * This is error prone but should cover more cases than the
+     * previous code.
+     */
+    public String[] parseShebangOptions(InputStream in) {
+        BufferedReader reader = null;
+        String[] result = new String[0];
+        if (in == null) return result;
+        try {
+            in.mark(1024);
+            reader = new BufferedReader(new InputStreamReader(in, "iso-8859-1"), 8192);
+            String firstLine = reader.readLine();
+
+            // Search for the shebang line in the given stream
+            // if it wasn't found on the first line and the -x option
+            // was specified
+            if (isxFlag()) {
+                while (firstLine != null && !isShebangLine(firstLine)) {
+                    firstLine = reader.readLine();
+                }
+            }
+
+            boolean usesEnv = false;
+            if (firstLine.length() > 2 && firstLine.charAt(0) == '#' && firstLine.charAt(1) == '!') {
+                String[] options = firstLine.substring(2).split("\\s+");
+                int i;
+                for (i = 0; i < options.length; i++) {
+                    // Skip /usr/bin/env if it's first
+                    if (i == 0 && options[i].endsWith("/env")) {
+                        usesEnv = true;
+                        continue;
+                    }
+                    // Skip any assignments if /usr/bin/env is in play
+                    if (usesEnv && options[i].indexOf('=') > 0) {
+                        continue;
+                    }
+                    // Skip any commandline args if /usr/bin/env is in play
+                    if (usesEnv && options[i].startsWith("-")) {
+                        continue;
+                    }
+                    String basename = (new File(options[i])).getName();
+                    if (basename.indexOf("ruby") > 0) {
+                        break;
+                    }
+                }
+                setHasShebangLine(true);
+                System.arraycopy(options, i, result, 0, options.length - i);
+            } else {
+                // No shebang line found
+                setHasShebangLine(false);
+            }
+        } catch (Exception ex) {
+            // ignore error
+        } finally {
+            try {
+                in.reset();
+            } catch (IOException ex) {}
+        }
+        return result;
+    }
+
+    protected static boolean isShebangLine(String line) {
+        return (line.length() > 2 && line.charAt(0) == '#' && line.charAt(1) == '!');
     }
 
     public CompileMode getCompileMode() {
@@ -753,8 +855,6 @@ public class RubyInstanceConfig {
     }
 
     public void setCompatVersion(CompatVersion compatVersion) {
-        // Until we get a little more solid on 1.9 support we will only run interpreted mode
-        if (compatVersion == CompatVersion.RUBY1_9) compileMode = CompileMode.OFF;
         if (compatVersion == null) compatVersion = CompatVersion.RUBY1_8;
 
         this.compatVersion = compatVersion;
@@ -801,6 +901,7 @@ public class RubyInstanceConfig {
     }
 
     public void setEnvironment(Map newEnvironment) {
+        if (newEnvironment == null) newEnvironment = new HashMap();
         environment = newEnvironment;
     }
 
@@ -840,16 +941,7 @@ public class RubyInstanceConfig {
                 jrubyHome = verifyHome(jrubyHome);
             } else {
                 try {
-                    // try loading from classloader resources
-                    final String jrubyHomePath = "/META-INF/jruby.home";
-                    URL jrubyHomeURL = getClass().getResource(jrubyHomePath);
-                    // special case for jar:file (most typical case)
-                    if (jrubyHomeURL.getProtocol().equals("jar")) {
-                        jrubyHome = jrubyHomeURL.getPath();
-                    } else {
-                        jrubyHome = "classpath:" + jrubyHomePath;
-                        return jrubyHome;
-                    }
+                    jrubyHome = SystemPropertyCatcher.findFromJar(this);
                 } catch (Exception e) {}
 
                 if (jrubyHome != null) {
@@ -917,12 +1009,16 @@ public class RubyInstanceConfig {
         }
 
         public void processArguments() {
+            processArguments(true);
+        }
+
+        public void processArguments(boolean inline) {
             while (argumentIndex < arguments.size() && isInterpreterArgument(arguments.get(argumentIndex).originalValue)) {
                 processArgument();
                 argumentIndex++;
             }
 
-            if (!hasInlineScript && scriptFileName == null) {
+            if (inline && !hasInlineScript && scriptFileName == null) {
                 if (argumentIndex < arguments.size()) {
                     setScriptFileName(arguments.get(argumentIndex).originalValue); //consume the file name
                     argumentIndex++;
@@ -1024,6 +1120,9 @@ public class RubyInstanceConfig {
                     inlineScript.append('\n');
                     hasInlineScript = true;
                     break FOR;
+                case 'E':
+                    processEncodingOption(grabValue(getArgumentError("unknown encoding name")));
+                    break FOR;
                 case 'F':
                     inputFieldSeparator = grabValue(getArgumentError(" -F must be followed by a pattern for input field separation"));
                     break FOR;
@@ -1086,6 +1185,9 @@ public class RubyInstanceConfig {
 
                     break FOR;
                 }
+                case 'U':
+                    internalEncoding = "UTF-8";
+                    break;
                 case 'v':
                     verbose = Boolean.TRUE;
                     setShowVersion(true);
@@ -1150,7 +1252,11 @@ public class RubyInstanceConfig {
                     String extendedOption = grabOptionalValue();
 
                     if (extendedOption == null) {
-                        throw new MainExitException(0, "jruby: missing extended option, listing available options\n" + getExtendedHelp());
+                        if (SafePropertyAccessor.getBoolean("jruby.launcher.nopreamble", false)) {
+                            throw new MainExitException(0, getExtendedHelp());
+                        } else {
+                            throw new MainExitException(0, "jruby: missing argument\n" + getExtendedHelp());
+                        }
                     } else if (extendedOption.equals("-O")) {
                         objectSpaceEnabled = false;
                     } else if (extendedOption.equals("+O")) {
@@ -1210,23 +1316,28 @@ public class RubyInstanceConfig {
                         break FOR;
                     } else if (argument.equals("--fast")) {
                         compileMode = CompileMode.FORCE;
-                        FASTEST_COMPILE_ENABLED = true;
                         FASTOPS_COMPILE_ENABLED = true;
-                        FRAMELESS_COMPILE_ENABLED = true;
-                        POSITIONLESS_COMPILE_ENABLED = true;
-                        FASTCASE_COMPILE_ENABLED = true;
                         FASTSEND_COMPILE_ENABLED = true;
                         INLINE_DYNCALL_ENABLED = true;
-                        RubyException.TRACE_TYPE = RubyException.RUBY_COMPILED;
                         break FOR;
-                    } else if (argument.equals("--profile")) {
-                        profiling = true;
+                    } else if (argument.equals("--profile.api")) {
+                        profilingMode = ProfilingMode.API;
+                        break FOR;
+                    } else if (argument.equals("--profile") ||
+                            argument.equals("--profile.flat")) {
+                        profilingMode = ProfilingMode.FLAT;
+                        break FOR;
+                    } else if (argument.equals("--profile.graph")) {
+                        profilingMode = ProfilingMode.GRAPH;
                         break FOR;
                     } else if (argument.equals("--1.9")) {
                         setCompatVersion(CompatVersion.RUBY1_9);
                         break FOR;
                     } else if (argument.equals("--1.8")) {
                         setCompatVersion(CompatVersion.RUBY1_8);
+                        break FOR;
+                    } else if (argument.equals("--disable-gems")) {
+                        disableGems = true;
                         break FOR;
                     } else {
                         if (argument.equals("--")) {
@@ -1239,6 +1350,20 @@ public class RubyInstanceConfig {
                 default:
                     throw new MainExitException(1, "jruby: unknown option " + argument);
                 }
+            }
+        }
+
+        private void processEncodingOption(String value) {
+            String[] encodings = value.split(":", 3);
+
+            switch(encodings.length) {
+                case 3:
+                    throw new MainExitException(1, "extra argument for -E: " + encodings[2]);
+                case 2:
+                    internalEncoding = encodings[1];
+                case 1:
+                    externalEncoding = encodings[0];
+                // Zero is impossible
             }
         }
 
@@ -1263,20 +1388,25 @@ public class RubyInstanceConfig {
         }
 
         private String resolveScript(String scriptName) {
-            // This try/catch is to allow failing over to the "commands" logic
+            // These try/catches are to allow failing over to the "commands" logic
             // when running from within a jruby-complete jar file, which has
             // jruby.home = a jar file URL that does not resolve correctly with
             // JRubyFile.create.
+            File fullName = null;
             try {
                 // try cwd first
-                File fullName = JRubyFile.create(currentDirectory, scriptName);
+                fullName = JRubyFile.create(currentDirectory, scriptName);
                 if (fullName.exists() && fullName.isFile()) {
                     if (DEBUG_SCRIPT_RESOLUTION) {
                         error.println("Found: " + fullName.getAbsolutePath());
                     }
                     return scriptName;
                 }
+            } catch (Exception e) {
+                // keep going, try bin/#{scriptName}
+            }
 
+            try {
                 fullName = JRubyFile.create(getJRubyHome(), "bin/" + scriptName);
                 if (fullName.exists() && fullName.isFile()) {
                     if (DEBUG_SCRIPT_RESOLUTION) {
@@ -1284,26 +1414,30 @@ public class RubyInstanceConfig {
                     }
                     return fullName.getAbsolutePath();
                 }
+            } catch (Exception e) {
+                // keep going, try PATH
+            }
 
-                try {
-                    String path = System.getenv("PATH");
-                    if (path != null) {
-                        String[] paths = path.split(System.getProperty("path.separator"));
-                        for (int i = 0; i < paths.length; i++) {
-                            fullName = JRubyFile.create(paths[i], scriptName);
-                            if (fullName.exists() && fullName.isFile()) {
-                                if (DEBUG_SCRIPT_RESOLUTION) {
-                                    error.println("Found: " + fullName.getAbsolutePath());
-                                }
-                                return fullName.getAbsolutePath();
+            try {
+                String path = System.getenv("PATH");
+                if (path != null) {
+                    String[] paths = path.split(System.getProperty("path.separator"));
+                    for (int i = 0; i < paths.length; i++) {
+                        fullName = JRubyFile.create(paths[i], scriptName);
+                        if (fullName.exists() && fullName.isFile()) {
+                            if (DEBUG_SCRIPT_RESOLUTION) {
+                                error.println("Found: " + fullName.getAbsolutePath());
                             }
+                            return fullName.getAbsolutePath();
                         }
                     }
-                } catch (SecurityException se) {
-                    // ignore and do nothing
                 }
-            } catch (IllegalArgumentException iae) {
-                if (debug) error.println("warning: could not resolve -S script on filesystem: " + scriptName);
+            } catch (Exception e) {
+                // will fall back to JRuby::Commands
+            }
+
+            if (debug) {
+                error.println("warning: could not resolve -S script on filesystem: " + scriptName);
             }
             return null;
         }
@@ -1387,6 +1521,8 @@ public class RubyInstanceConfig {
                 InputStream stream = null;
                 if (script.startsWith("file:") && script.indexOf(".jar!/") != -1) {
                     stream = new URL("jar:" + script).openStream();
+                } else if (script.startsWith("classpath:")) {
+                    stream = Ruby.getClassLoader().getResourceAsStream(script.substring("classpath:".length()));
                 } else {
                     File file = JRubyFile.create(getCurrentDirectory(), getScriptFileName());
                     if (isxFlag()) {
@@ -1559,6 +1695,14 @@ public class RubyInstanceConfig {
         this.kcode = kcode;
     }
 
+    public String getInternalEncoding() {
+        return internalEncoding;
+    }
+
+    public String getExternalEncoding() {
+        return externalEncoding;
+    }
+
     public String getRecordSeparator() {
         return recordSeparator;
     }
@@ -1616,10 +1760,48 @@ public class RubyInstanceConfig {
     }
 
     public boolean isProfiling() {
-        return profiling;
+        return profilingMode != ProfilingMode.OFF;
+    }
+    
+    public boolean isProfilingEntireRun() {
+        return profilingMode != ProfilingMode.OFF && profilingMode != ProfilingMode.API;
     }
 
-    public void setProfiling(boolean profiling) {
-        this.profiling = profiling;
+    public ProfilingMode getProfilingMode() {
+        return profilingMode;
+    }
+    
+    public AbstractProfilePrinter makeDefaultProfilePrinter(IProfileData profileData) {
+        if (profilingMode == ProfilingMode.FLAT) {
+            return new FlatProfilePrinter(profileData.getResults());
+        }
+        else if (profilingMode == ProfilingMode.GRAPH) {
+            return new GraphProfilePrinter(profileData.getResults());
+        }
+        return null;
+    }
+
+    public boolean isDisableGems() {
+        return disableGems;
+    }
+
+    public void setDisableGems(boolean dg) {
+        this.disableGems = dg;
+    }
+
+    public TraceType getTraceType() {
+        return traceType;
+    }
+
+    public void setTraceType(TraceType traceType) {
+        this.traceType = traceType;
+    }
+    
+    public static boolean hasLoadedNativeExtensions() {
+        return loadedNativeExtensions;
+    }
+    
+    public static void setLoadedNativeExtensions(boolean loadedNativeExtensions) {
+        RubyInstanceConfig.loadedNativeExtensions = loadedNativeExtensions;
     }
 }

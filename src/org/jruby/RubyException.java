@@ -36,6 +36,7 @@
  ***** END LICENSE BLOCK *****/
 package org.jruby;
 
+import org.jruby.runtime.backtrace.BacktraceData;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.List;
@@ -49,13 +50,14 @@ import org.jruby.runtime.ClassIndex;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ObjectMarshal;
 import org.jruby.runtime.ThreadContext;
+import org.jruby.runtime.backtrace.RubyStackTraceElement;
+import org.jruby.runtime.backtrace.TraceType;
 import static org.jruby.runtime.Visibility.*;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.runtime.builtin.Variable;
 import org.jruby.runtime.component.VariableEntry;
 import org.jruby.runtime.marshal.MarshalStream;
 import org.jruby.runtime.marshal.UnmarshalStream;
-import org.jruby.util.SafePropertyAccessor;
 
 /**
  *
@@ -63,7 +65,7 @@ import org.jruby.util.SafePropertyAccessor;
  */
 @JRubyClass(name="Exception")
 public class RubyException extends RubyObject {
-    private ThreadContext.RubyStackTraceElement[] backtraceElements;
+    private BacktraceData backtraceData;
     private IRubyObject backtrace;
     public IRubyObject message;
     public static final int TRACE_HEAD = 8;
@@ -136,60 +138,32 @@ public class RubyException extends RubyObject {
     public static RubyException newException(Ruby runtime, RubyClass excptnClass, String msg) {
         return new RubyException(runtime, excptnClass, msg);
     }
-    
-    public void setBacktraceElements(ThreadContext.RubyStackTraceElement[] backtraceElements) {
-        this.backtraceElements = backtraceElements;
+
+    public void setBacktraceData(BacktraceData backtraceData) {
+        this.backtraceData = backtraceData;
     }
-    
-    public ThreadContext.RubyStackTraceElement[] getBacktraceElements() {
-        return backtraceElements;
+
+    public BacktraceData getBacktraceData() {
+        return backtraceData;
+    }
+
+    public RubyStackTraceElement[] getBacktraceElements() {
+        if (backtraceData == null) {
+            return RubyStackTraceElement.EMPTY_ARRAY;
+        }
+        return backtraceData.getBacktrace(getRuntime());
     }
 
     public void prepareBacktrace(ThreadContext context, boolean nativeException) {
         // if it's null, build a backtrace
-        boolean fullTrace = false;
-        if (backtraceElements == null) {
-            switch (TRACE_TYPE) {
-            case RAW:
-                fullTrace = true;
-            case RAW_FILTERED:
-                backtraceElements = ThreadContext.gatherRawBacktrace(getRuntime(), Thread.currentThread().getStackTrace(), !fullTrace);
-                break;
-            case FULL:
-                fullTrace = true;
-            default:
-                backtraceElements = ThreadContext.gatherHybridBacktrace(
-                        context.getRuntime(),
-                        context.createBacktrace2(0, nativeException),
-                        Thread.currentThread().getStackTrace(),
-                        fullTrace);
-            }
+        if (backtraceData == null) {
+            backtraceData = context.runtime.getInstanceConfig().getTraceType().getBacktrace(context, nativeException);
         }
     }
-    
-    public static final int RAW = 0;
-    public static final int RAW_FILTERED = 1;
-    public static final int RUBY_FRAMED = 2;
-    public static final int RUBY_COMPILED = 3;
-    public static final int RUBY_HYBRID = 4;
-    public static final int RUBINIUS = 5;
-    public static final int FULL = 6;
 
-    public static final int RAW_FRAME_CROP_COUNT = 10;
-    
-    public static int TRACE_TYPE;
-    
-    static {
-        String style = SafePropertyAccessor.getProperty("jruby.backtrace.style", "ruby_framed").toLowerCase();
-        
-        if (style.equalsIgnoreCase("raw")) TRACE_TYPE = RAW;
-        else if (style.equalsIgnoreCase("raw_filtered")) TRACE_TYPE = RAW_FILTERED;
-        else if (style.equalsIgnoreCase("ruby_framed")) TRACE_TYPE = RUBY_FRAMED;
-        else if (style.equalsIgnoreCase("ruby_compiled")) TRACE_TYPE = RUBY_COMPILED;
-        else if (style.equalsIgnoreCase("ruby_hybrid")) TRACE_TYPE = RUBY_HYBRID;
-        else if (style.equalsIgnoreCase("rubinius")) TRACE_TYPE = RUBINIUS;
-        else if (style.equalsIgnoreCase("full")) TRACE_TYPE = FULL;
-        else TRACE_TYPE = RUBY_FRAMED;
+    public void forceBacktrace(IRubyObject backtrace) {
+        backtraceData = BacktraceData.EMPTY;
+        set_backtrace(backtrace);
     }
     
     public IRubyObject getBacktrace() {
@@ -200,7 +174,12 @@ public class RubyException extends RubyObject {
     }
     
     public void initBacktrace() {
-        backtrace = ThreadContext.renderBacktraceMRI(getRuntime(), backtraceElements);
+        Ruby runtime = getRuntime();
+        if (backtraceData == null) {
+            backtrace = runtime.getNil();
+        } else {
+            backtrace = TraceType.generateMRIBacktrace(runtime, backtraceData.getBacktrace(runtime));
+        }
     }
 
     @JRubyMethod(optional = 2, visibility = PRIVATE)
@@ -251,7 +230,7 @@ public class RubyException extends RubyObject {
 
     @JRubyMethod(name = "to_s")
     public IRubyObject to_s(ThreadContext context) {
-        if (message.isNil()) return context.getRuntime().newString(getMetaClass().getName());
+        if (message.isNil()) return context.getRuntime().newString(getMetaClass().getRealClass().getName());
         message.setTaint(isTaint());
         return message;
     }
@@ -308,14 +287,13 @@ public class RubyException extends RubyObject {
     @Override
     public void copySpecialInstanceVariables(IRubyObject clone) {
         RubyException exception = (RubyException)clone;
-        exception.backtraceElements = backtraceElements;
+        exception.backtraceData = backtraceData;
         exception.backtrace = backtrace;
         exception.message = message;
     }
 
     public void printBacktrace(PrintStream errorStream) {
         IRubyObject backtrace = callMethod(getRuntime().getCurrentContext(), "backtrace");
-        boolean debug = getRuntime().getDebug().isTrue();
         if (!backtrace.isNil() && backtrace instanceof RubyArray) {
             IRubyObject[] elements = backtrace.convertToArray().toJavaArray();
 

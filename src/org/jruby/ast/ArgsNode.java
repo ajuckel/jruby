@@ -129,7 +129,6 @@ public class ArgsNode extends Node {
     }
 
     protected Arity calculateArity() {
-        if (restArgNode instanceof UnnamedRestArgNode) return Arity.optional();
         if (getOptArgs() != null || getRestArg() >= 0) return Arity.required(getRequiredArgsCount());
 
         return Arity.createArity(getRequiredArgsCount());
@@ -242,7 +241,7 @@ public class ArgsNode extends Node {
         if (!hasMasgnArgs) {
             // no arg grouping, just use bulk assignment methods
             if (preCount > 0) scope.setArgValues(args, Math.min(args.length, preCount));
-            if (postCount > 0) scope.setEndArgValues(args, postIndex, postCount);
+            if (postCount > 0 && args.length > preCount) scope.setEndArgValues(args, postIndex, Math.min(args.length - preCount, postCount));
         } else {
             masgnAwareArgAssign(context, runtime, self, args, block, scope);
         }
@@ -260,8 +259,12 @@ public class ArgsNode extends Node {
                 Node next = pre.get(i);
                 if (next instanceof AssignableNode) {
                     ((AssignableNode)next).assign(runtime, context, self, args[i], block, false);
+                } else if (next instanceof ArgumentNode) {
+                    ArgumentNode argNode = (ArgumentNode) next;
+                    scope.setValue(argNode.getIndex(), args[i], argNode.getDepth());
                 } else {
-                    scope.setValue(i, args[i], 0);
+                    // TODO: Replace with assert later
+                    throw new RuntimeException("Whoa..not assignable and not an argument...what is it: " + next);
                 }
             }
         }
@@ -272,8 +275,12 @@ public class ArgsNode extends Node {
                 Node next = post.get(i);
                 if (next instanceof AssignableNode) {
                     ((AssignableNode)next).assign(runtime, context, self, args[argsLength - postCount + i], block, false);
+                } else if (next instanceof ArgumentNode) {
+                    ArgumentNode argNode = (ArgumentNode) next;
+                    scope.setValue(argNode.getIndex(), args[argsLength - postCount + i], argNode.getDepth());
                 } else {
-                    scope.setValue(i + postIndex, args[argsLength - postCount + i], 0);
+                    // TODO: Replace with assert later
+                    throw new RuntimeException("Whoa..not assignable and not an argument...what is it: " + next);
                 }
             }
         }

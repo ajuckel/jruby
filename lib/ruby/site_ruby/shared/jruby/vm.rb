@@ -83,18 +83,18 @@ module JRuby
     end
   end
   
-  import java.util.concurrent.LinkedBlockingQueue
-  import java.util.HashMap  
+  java_import java.util.concurrent.LinkedBlockingQueue
+  java_import java.util.HashMap  
 
   class ChildVM < VM
     JThread = java.lang.Thread
     Runnable = java.lang.Runnable
-    import org.jruby.RubyInstanceConfig
-    import org.jruby.Ruby
-    import org.jruby.RubyIO
-    import java.nio.channels.Pipe
-    import java.nio.channels.Channels
-    import java.io.PrintStream
+    java_import org.jruby.RubyInstanceConfig
+    java_import org.jruby.Ruby
+    java_import org.jruby.RubyIO
+    java_import java.nio.channels.Pipe
+    java_import java.nio.channels.Channels
+    java_import java.io.PrintStream
     
     attr_reader :stdin
     attr_reader :stdout
@@ -123,26 +123,57 @@ module JRuby
 
       # set up queue
       @queue = LinkedBlockingQueue.new
+    end
+
+    def start
+      if @started
+        raise RuntimeError, "already started VM"
+      end
 
       # Create the main thread for the child VM
-      @main = JThread.new Runnable.impl {
-        @runtime = Ruby.new_instance(@config)
-        @runtime.load_service.require('jruby/vm')
-        vm_class = JRuby.reference(@runtime.get_class_from_path("JRuby::VM"))
-        vm_class.set_constant("CURRENT", self)
-        vm_class.set_constant("MAP", JRuby.reference(MAP))
+      @main = JThread.new do
+        begin
+          @runtime = Ruby.new_instance(@config)
+          @runtime.load_service.require('jruby/vm')
+          vm_class = JRuby.reference(@runtime.get_class_from_path("JRuby::VM"))
+          vm_class.set_constant("CURRENT", self)
+          vm_class.set_constant("MAP", JRuby.reference(MAP))
 
-        script = @config.script_source
-        filename = @config.displayed_file_name
-        @runtime.run_from_main(script, filename)
+          script = @config.script_source
+          filename = @config.displayed_file_name
+          @runtime.run_from_main(script, filename)
 
-        # shut down the streams
-        @config.input.close
-        @config.output.close
-        @config.error.close
-      }
+          # shut down the streams
+          @config.input.close
+          @config.output.close
+          @config.error.close
+        rescue Exception => e
+          e.printStackTrace
+        end
+      end
 
       @main.start
+      @started = true
+    end
+
+    def send(obj)
+      _check_started
+      super
+    end
+
+    def join
+      _check_started
+      super
+    end
+
+    def <<(obj)
+      _check_started
+      super
+    end
+
+    private
+    def _check_started
+      raise RuntimeError, "child VM not started" unless @started
     end
   end
   

@@ -38,6 +38,10 @@ public class BasicBlock {
         return _id;
     }
 
+    public Label getLabel() {
+        return _label;
+    }
+
     public void addInstr(Instr i) {
         _instrs.add(i);
     }
@@ -48,6 +52,15 @@ public class BasicBlock {
 
     public List<Instr> getInstrs() {
         return _instrs;
+    }
+
+	 private Instr[] _instrsArray = null;
+
+    public Instr[] getInstrsArray() {
+		  if (_instrsArray == null) {
+            _instrsArray = _instrs.toArray(new Instr[_instrs.size()]);
+		  }
+		  return _instrsArray;
     }
 
     public Instr getLastInstr() {

@@ -34,52 +34,56 @@ import org.jruby.runtime.builtin.IRubyObject;
  * args field: [self, receiver, *args]
  */
 public class CallInstr extends MultiOperandInstr {
-    private Operand receiver;
+    private Operand   receiver;
     private Operand[] arguments;
-    Operand _methAddr;
-    Operand _closure;
+    MethAddr methAddr;
+    Operand closure;
     
     private boolean _flagsComputed;
     private boolean _canBeEval;
     private boolean _requiresBinding;    // Does this call make use of the caller's binding?
     public HashMap<DynamicMethod, Integer> _profile;
 
-    public CallInstr(Variable result, Operand methAddr, Operand receiver, Operand[] args, Operand closure) {
-        super(Operation.CALL, result, buildAllArgs(methAddr, receiver, args, closure));
+    public CallInstr(Variable result, MethAddr methAddr, Operand receiver, Operand[] args, Operand closure) {
+        super(Operation.CALL, result);
 
         this.receiver = receiver;
         this.arguments = args;
+        this.methAddr = methAddr;
+        this.closure = closure;
 
-        _methAddr = methAddr;
-        _closure = closure;
         _flagsComputed = false;
         _canBeEval = true;
         _requiresBinding = true;
     }
 
-    public CallInstr(Operation op, Variable result, Operand methAddr, Operand receiver, Operand[] args, Operand closure) {
-        super(op, result, buildAllArgs(methAddr, receiver, args, closure));
+    public CallInstr(Operation op, Variable result, MethAddr methAddr, Operand receiver, Operand[] args, Operand closure) {
+        super(op, result);
 
         this.receiver = receiver;
         this.arguments = args;
-        
-        _methAddr = methAddr;
-        _closure = closure;
+        this.methAddr = methAddr;
+        this.closure = closure;
+
         _flagsComputed = false;
         _canBeEval = true;
         _requiresBinding = true;
     }
 
-    public void setMethodAddr(Operand mh) {
-        _methAddr = mh;
+    public Operand[] getOperands() {
+        return buildAllArgs(methAddr, receiver, arguments, closure);
     }
 
-    public Operand getMethodAddr() {
-        return _methAddr;
+    public void setMethodAddr(MethAddr mh) {
+        this.methAddr = mh;
+    }
+
+    public MethAddr getMethodAddr() {
+        return methAddr;
     }
 
     public Operand getClosureArg() {
-        return _closure;
+        return closure;
     }
 
     public Operand getReceiver() {
@@ -88,6 +92,17 @@ public class CallInstr extends MultiOperandInstr {
 
     public Operand[] getCallArgs() {
         return arguments;
+    }
+
+    @Override
+    public void simplifyOperands(Map<Operand, Operand> valueMap) {
+        receiver = receiver.getSimplifiedOperand(valueMap);
+        methAddr = (MethAddr)methAddr.getSimplifiedOperand(valueMap);
+        for (int i = 0; i < arguments.length; i++) {
+            arguments[i] = arguments[i].getSimplifiedOperand(valueMap);
+        }
+        if (closure != null) closure = closure.getSimplifiedOperand(valueMap);
+        _flagsComputed = false; // Forces recomputation of flags
     }
 
     public Operand[] cloneCallArgs(InlinerInfo ii) {
@@ -99,14 +114,6 @@ public class CallInstr extends MultiOperandInstr {
         }
 
         return clonedArgs;
-    }
-
-    @Override
-    public void simplifyOperands(Map<Operand, Operand> valueMap) {
-        super.simplifyOperands(valueMap);
-        _methAddr = _args[0];
-        _closure = (_closure == null) ? null : _args[_args.length - 1];
-        _flagsComputed = false; // Forces recomputation of flags
     }
 
     public boolean isRubyInternalsCall() {
@@ -121,9 +128,7 @@ public class CallInstr extends MultiOperandInstr {
     // In a JIT context, we might be compiling this call in the context of a surrounding PIC (or a monomorphic IC).
     // If so, the receiver type and hence the target method will be known.
     public IRMethod getTargetMethodWithReceiver(Operand receiver) {
-        if (!(_methAddr instanceof MethAddr)) return null;
-
-        String mname = ((MethAddr) _methAddr).getName();
+        String mname = methAddr.getName();
 
         if (receiver instanceof MetaObject) {
             IRModule m = (IRModule) (((MetaObject) receiver).scope);
@@ -155,32 +160,26 @@ public class CallInstr extends MultiOperandInstr {
 
     // SSS FIXME: Are all bases covered?
     private boolean getEvalFlag() {
-        Operand ma = getMethodAddr();
-
         // ENEBO: This could be made into a recursive two-method thing so then: send(:send, :send, :send, :send, :eval, "Hosed") works
         // ENEBO: This is not checking for __send__
-        if (ma instanceof MethAddr) {
-            String mname = ((MethAddr) ma).getName();
-            // checking for "call" is conservative.  It can be eval only if the receiver is a Method
-            if (mname.equals("call") || mname.equals("eval")) return true;
+        String mname = getMethodAddr().getName();
+        // checking for "call" is conservative.  It can be eval only if the receiver is a Method
+        if (mname.equals("call") || mname.equals("eval")) return true;
 
-            // Calls to 'send' where the first arg is either unknown or is eval or send (any others?)
-            if (mname.equals("send")) {
-                Operand[] args = getCallArgs();
-                if (args.length >= 2) {
-                    Operand meth = args[0];
-                    if (!(meth instanceof StringLiteral)) return true; // We don't know
+        // Calls to 'send' where the first arg is either unknown or is eval or send (any others?)
+        if (mname.equals("send")) {
+            Operand[] args = getCallArgs();
+            if (args.length >= 2) {
+                Operand meth = args[0];
+                if (!(meth instanceof StringLiteral)) return true; // We don't know
 
-                    // But why?  Why are you killing yourself (and us) doing this?
-                    String name = ((StringLiteral) meth)._str_value;
-                    if (name.equals("call") || name.equals("eval") || name.equals("send")) return true;
-                }
+                // But why?  Why are you killing yourself (and us) doing this?
+                String name = ((StringLiteral) meth)._str_value;
+                if (name.equals("call") || name.equals("eval") || name.equals("send")) return true;
             }
+        }
             
-            return false; // All checks passed
-        } 
-        
-        return true; // Unknown method -- could be eval!
+        return false; // All checks passed
     }
 
     private boolean getRequiresBindingFlag() {
@@ -188,21 +187,18 @@ public class CallInstr extends MultiOperandInstr {
         // SSS FIXME: This is conservative, but will let that go for now
         if (canBeEval() /*|| canCaptureCallersBinding()*/) return true;
 
-        if (_closure != null) {
+        if (closure != null) {
             // Can be a symbol .. ex: [1,2,3,4].map(&:foo)
             // SSS FIXME: Is it true that if the closure operand is a symbol, it couldn't access the caller's binding?
-            if (!(_closure instanceof MetaObject)) return false;
+            if (!(closure instanceof MetaObject)) return false;
 
-            IRClosure cl = (IRClosure) ((MetaObject) _closure).scope;
+            IRClosure cl = (IRClosure) ((MetaObject) closure).scope;
             if (cl.requiresBinding() /*|| cl.canCaptureCallersBinding()*/) return true;
         }
 
         // Check if we are calling Proc.new or lambda
-        Operand ma = getMethodAddr();
-        // Unknown target -- could be lambda or Proc.new
-        if (!(ma instanceof MethAddr)) return true;
-
-        String mname = ((MethAddr) ma).getName();
+        String mname = getMethodAddr().getName();
+        
         if (mname.equals("lambda")) {
            return true;
         } else if (mname.equals("new")) {
@@ -245,11 +241,12 @@ public class CallInstr extends MultiOperandInstr {
          * We should do this better by setting default flags for various core library methods
          * and by checking type of receiver to see if the receiver is any core object (string, array, etc.)
          *
-        if (_methAddr instanceof MethAddr) {
-        String n = ((MethAddr)_methAddr).getName();
+        if (methAddr instanceof MethAddr) {
+        String n = ((MethAddr)methAddr).getName();
         return !n.equals("each") && !n.equals("inject") && !n.equals("+") && !n.equals("*") && !n.equals("+=") && !n.equals("*=");
         }
          **/
+
         Operand r = getReceiver();
         IRMethod rm = getTargetMethodWithReceiver(r);
 
@@ -273,13 +270,13 @@ public class CallInstr extends MultiOperandInstr {
     public String toString() {
         return "\t"
                 + (result == null ? "" : result + " = ")
-                + operation + "(" + _methAddr + ", " + receiver + ", " +
+                + operation + "(" + methAddr + ", " + receiver + ", " +
                 java.util.Arrays.toString(getCallArgs())
-                + (_closure == null ? "" : ", &" + _closure) + ")";
+                + (closure == null ? "" : ", &" + closure) + ")";
     }
 
     public Instr cloneForInlining(InlinerInfo ii) {
-        return new CallInstr(ii.getRenamedVariable(result), _methAddr.cloneForInlining(ii), receiver.cloneForInlining(ii), cloneCallArgs(ii), _closure == null ? null : _closure.cloneForInlining(ii));
+        return new CallInstr(ii.getRenamedVariable(result), (MethAddr) methAddr.cloneForInlining(ii), receiver.cloneForInlining(ii), cloneCallArgs(ii), closure == null ? null : closure.cloneForInlining(ii));
    }
 
 // --------------- Private methods ---------------
@@ -306,9 +303,8 @@ public class CallInstr extends MultiOperandInstr {
 
     @Override
     public Label interpret(InterpreterContext interp, IRubyObject self) {
-        Object        ma    = _methAddr.retrieve(interp);
-        IRubyObject[] args  = prepareArguments(interp);
-        Block         block = (_closure == null) ? null : prepareBlock(interp);
+        Object        ma    = methAddr.retrieve(interp);
+        IRubyObject[] args  = prepareArguments(getCallArgs(), interp);
         Object resultValue;
         if (ma instanceof MethodHandle) {
             MethodHandle  mh = (MethodHandle)ma;
@@ -319,21 +315,25 @@ public class CallInstr extends MultiOperandInstr {
             String        mn = mh.getResolvedMethodName();
             IRubyObject   ro = mh.getReceiverObj();
             if (m.isUndefined()) {
-                resultValue = RuntimeHelpers.callMethodMissing(interp.getContext(), ro, m.getVisibility(), mn, CallType.FUNCTIONAL, args, block == null ? Block.NULL_BLOCK : block);
+                resultValue = RuntimeHelpers.callMethodMissing(interp.getContext(), ro, 
+                        m.getVisibility(), mn, CallType.FUNCTIONAL, args, prepareBlock(interp));
             } else {
-               ThreadContext tc = interp.getContext();
-               RubyClass     rc = ro.getMetaClass();
-               resultValue = (block == null) ? m.call(tc, ro, rc, mn, args) : m.call(tc, ro, rc, mn, args, block);
+                try {
+                    resultValue = m.call(interp.getContext(), ro, ro.getMetaClass(), mn, args,
+                            prepareBlock(interp));
+                } catch (org.jruby.exceptions.JumpException.BreakJump bj) {
+                    resultValue = (IRubyObject) bj.getValue();
+                }
             }
         } else {
-           IRubyObject object = (IRubyObject) getReceiver().retrieve(interp);
-           String name = ma.toString(); // SSS FIXME: If this is not a ruby string or a symbol, then this is an error in the source code!
-
-           if (block == null) {
-               resultValue = object.callMethod(interp.getContext(), name, args);
-           } else {
-               resultValue = object.callMethod(interp.getContext(), name, args, block);
-           }
+            IRubyObject object = (IRubyObject) getReceiver().retrieve(interp);
+            String name = ma.toString(); // SSS FIXME: If this is not a ruby string or a symbol, then this is an error in the source code!
+           
+            try {
+                resultValue = object.callMethod(interp.getContext(), name, args, prepareBlock(interp));
+            } catch (org.jruby.exceptions.JumpException.BreakJump bj) {
+                resultValue = (IRubyObject) bj.getValue();
+            }
         }
 
         getResult().store(interp, resultValue);
@@ -341,9 +341,8 @@ public class CallInstr extends MultiOperandInstr {
     }
 
     public Label interpret_with_inline(InterpreterContext interp, IRubyObject self) {
-        Object        ma    = _methAddr.retrieve(interp);
-        IRubyObject[] args  = prepareArguments(interp);
-        Block         block = (_closure == null) ? null : prepareBlock(interp);
+        Object        ma    = methAddr.retrieve(interp);
+        IRubyObject[] args  = prepareArguments(getCallArgs(), interp);
         Object resultValue;
         if (ma instanceof MethodHandle) {
             MethodHandle  mh = (MethodHandle)ma;
@@ -354,7 +353,8 @@ public class CallInstr extends MultiOperandInstr {
             String        mn = mh.getResolvedMethodName();
             IRubyObject   ro = mh.getReceiverObj();
             if (m.isUndefined()) {
-                resultValue = RuntimeHelpers.callMethodMissing(interp.getContext(), ro, m.getVisibility(), mn, CallType.FUNCTIONAL, args, block == null ? Block.NULL_BLOCK : block);
+                resultValue = RuntimeHelpers.callMethodMissing(interp.getContext(), ro, 
+                        m.getVisibility(), mn, CallType.FUNCTIONAL, args, prepareBlock(interp));
             } else {
                ThreadContext tc = interp.getContext();
                RubyClass     rc = ro.getMetaClass();
@@ -373,17 +373,13 @@ public class CallInstr extends MultiOperandInstr {
                   }
                }
                _profile.put(m, count);
-               resultValue = (block == null) ? m.call(tc, ro, rc, mn, args) : m.call(tc, ro, rc, mn, args, block);
+               resultValue = m.call(tc, ro, rc, mn, args, prepareBlock(interp));
             }
         } else {
            IRubyObject object = (IRubyObject) getReceiver().retrieve(interp);
            String name = ma.toString(); // SSS FIXME: If this is not a ruby string or a symbol, then this is an error in the source code!
 
-           if (block == null) {
-               resultValue = object.callMethod(interp.getContext(), name, args);
-           } else {
-               resultValue = object.callMethod(interp.getContext(), name, args, block);
-           }
+           resultValue = object.callMethod(interp.getContext(), name, args, prepareBlock(interp));
         }
 
         getResult().store(interp, resultValue);
@@ -391,20 +387,8 @@ public class CallInstr extends MultiOperandInstr {
     }
 
     private Block prepareBlock(InterpreterContext interp) {
-        Object value = _closure.retrieve(interp);
+        if (closure == null) return Block.NULL_BLOCK;
+        Object value = closure.retrieve(interp);
         return value instanceof RubyProc ? ((RubyProc) value).getBlock() : (Block) value;
-    }
-
-    public IRubyObject[] prepareArguments(InterpreterContext interp) {
-        // SSS FIXME: These 3 values could be memoized.
-        Operand[] operands = getCallArgs();
-        int length = operands.length;
-        IRubyObject[] args = new IRubyObject[length];
-
-        for (int i = 0; i < length; i++) {
-            args[i] = (IRubyObject) operands[i].retrieve(interp);
-        }
-
-        return args;
     }
 }

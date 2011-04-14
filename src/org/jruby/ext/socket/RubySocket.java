@@ -82,6 +82,7 @@ import java.net.Inet6Address;
 import java.nio.channels.AlreadyConnectedException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.ConnectionPendingException;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.spi.AbstractSelectableChannel;
 
 /**
@@ -147,6 +148,7 @@ public class RubySocket extends RubyBasicSocket {
         super(runtime, type);
     }
 
+    @Override
     protected int getSoTypeDefault() {
         return soType;
     }
@@ -326,6 +328,11 @@ public class RubySocket extends RubyBasicSocket {
         return runtime.newFixnum(port);
     }
 
+    @JRubyMethod(name = "listen", backtrace = true)
+    public IRubyObject listen(ThreadContext context, IRubyObject backlog) {
+        return context.getRuntime().newFixnum(0);
+    }
+
     @Deprecated
     public static IRubyObject pack_sockaddr_un(IRubyObject recv, IRubyObject filename) {
         return pack_sockaddr_un(recv.getRuntime().getCurrentContext(), recv, filename);
@@ -356,7 +363,6 @@ public class RubySocket extends RubyBasicSocket {
         } catch(ClosedChannelException e) {
             throw context.getRuntime().newErrnoECONNREFUSEDError();
         } catch(IOException e) {
-            e.printStackTrace();
             throw sockerr(context.getRuntime(), "connect(2): name or service not known");
         } catch (Error e) {
             // Workaround for a bug in Sun's JDK 1.5.x, see
@@ -403,7 +409,6 @@ public class RubySocket extends RubyBasicSocket {
                     }
                     throw context.getRuntime().newErrnoEINPROGRESSError();
                 } catch (IOException ex) {
-                    e.printStackTrace();
                     throw sockerr(context.getRuntime(), "connect(2): name or service not known");
                 }
             }
@@ -413,7 +418,6 @@ public class RubySocket extends RubyBasicSocket {
         } catch(SocketException e) {
             handleSocketException(context.getRuntime(), "connect", e);
         } catch(IOException e) {
-            e.printStackTrace();
             throw sockerr(context.getRuntime(), "connect(2): name or service not known");
         } catch (IllegalArgumentException iae) {
             throw sockerr(context.getRuntime(), iae.getMessage());
@@ -455,7 +459,6 @@ public class RubySocket extends RubyBasicSocket {
         } catch(SocketException e) {
             handleSocketException(context.getRuntime(), "bind", e);
         } catch(IOException e) {
-            e.printStackTrace();
             throw sockerr(context.getRuntime(), "bind(2): name or service not known");
         } catch (IllegalArgumentException iae) {
             throw sockerr(context.getRuntime(), iae.getMessage());
@@ -514,16 +517,9 @@ public class RubySocket extends RubyBasicSocket {
         ByteArrayOutputStream bufS = new ByteArrayOutputStream();
         try {
             DataOutputStream ds = new DataOutputStream(bufS);
-            if(Platform.IS_BSD) {
-                ds.write(16);
-                ds.write(2);
-            } else {
-                ds.write(2);
-                ds.write(0);
-            }
 
-            ds.write(iport >> 8);
-            ds.write(iport);
+            writeSockaddrHeader(ds);
+            writeSockaddrPort(ds, iport);
 
             try {
                 if(host != null && "".equals(host)) {
@@ -537,8 +533,31 @@ public class RubySocket extends RubyBasicSocket {
                 throw sockerr(context.getRuntime(), "getaddrinfo: No address associated with nodename");
             }
 
-            ds.writeInt(0);
-            ds.writeInt(0);
+            writeSockaddrFooter(ds);
+        } catch (IOException e) {
+            throw sockerr(context.getRuntime(), "pack_sockaddr_in: internal error");
+        }
+
+        return context.getRuntime().newString(new ByteList(bufS.toByteArray(),
+                false));
+    }
+    static IRubyObject pack_sockaddr_in(ThreadContext context, InetSocketAddress sock) {
+        ByteArrayOutputStream bufS = new ByteArrayOutputStream();
+        try {
+            DataOutputStream ds = new DataOutputStream(bufS);
+
+            writeSockaddrHeader(ds);
+            writeSockaddrPort(ds, sock);
+
+            String host = sock.getAddress().getHostAddress();
+            if(host != null && "".equals(host)) {
+                ds.writeInt(0);
+            } else {
+                byte[] addr = sock.getAddress().getAddress();
+                ds.write(addr, 0, addr.length);
+            }
+
+            writeSockaddrFooter(ds);
         } catch (IOException e) {
             throw sockerr(context.getRuntime(), "pack_sockaddr_in: internal error");
         }
@@ -552,20 +571,20 @@ public class RubySocket extends RubyBasicSocket {
     }
     @JRubyMethod(meta = true)
     public static IRubyObject unpack_sockaddr_in(ThreadContext context, IRubyObject recv, IRubyObject addr) {
-        String val = addr.convertToString().toString();
-        if((Platform.IS_BSD && val.charAt(0) != 16 && val.charAt(1) != 2) || (!Platform.IS_BSD && val.charAt(0) != 2)) {
+        ByteList val = addr.convertToString().getByteList();
+        if((Platform.IS_BSD && val.get(0) != 16 && val.get(1) != 2) || (!Platform.IS_BSD && val.get(0) != 2)) {
             throw context.getRuntime().newArgumentError("can't resolve socket address of wrong type");
         }
 
-        int port = (val.charAt(2) << 8) + (val.charAt(3));
+        int port = ((val.get(2)&0xff) << 8) + (val.get(3)&0xff);
         StringBuilder sb = new StringBuilder();
-        sb.append((int)val.charAt(4));
+        sb.append(val.get(4)&0xff);
         sb.append(".");
-        sb.append((int)val.charAt(5));
+        sb.append(val.get(5)&0xff);
         sb.append(".");
-        sb.append((int)val.charAt(6));
+        sb.append(val.get(6)&0xff);
         sb.append(".");
-        sb.append((int)val.charAt(7));
+        sb.append(val.get(7)&0xff);
 
         IRubyObject[] result = new IRubyObject[]{
                 context.getRuntime().newFixnum(port),
@@ -773,6 +792,30 @@ public class RubySocket extends RubyBasicSocket {
 
     private static String getHostAddress(IRubyObject recv, InetAddress addr) {
         return do_not_reverse_lookup(recv).isTrue() ? addr.getHostAddress() : addr.getCanonicalHostName();
+    }
+
+    private static void writeSockaddrHeader(DataOutputStream ds) throws IOException {
+        if (Platform.IS_BSD) {
+            ds.write(16);
+            ds.write(2);
+        } else {
+            ds.write(2);
+            ds.write(0);
+        }
+    }
+
+    private static void writeSockaddrFooter(DataOutputStream ds) throws IOException {
+        ds.writeInt(0);
+        ds.writeInt(0);
+    }
+
+    private static void writeSockaddrPort(DataOutputStream ds, InetSocketAddress sockaddr) throws IOException {
+        writeSockaddrPort(ds, sockaddr.getPort());
+    }
+
+    private static void writeSockaddrPort(DataOutputStream ds, int port) throws IOException {
+        ds.write(port >> 8);
+        ds.write(port);
     }
 
     private static final Pattern STRING_IPV4_ADDRESS_PATTERN =

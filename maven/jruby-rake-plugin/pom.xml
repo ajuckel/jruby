@@ -3,14 +3,14 @@
   <parent>
     <groupId>org.jruby</groupId>
     <artifactId>shared</artifactId>
-    <version>1.6.0.dev</version>
+    <version>1.6.1</version>
     <relativePath>../../pom.xml</relativePath>
   </parent>
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.jruby.plugins</groupId>
   <artifactId>jruby-rake-plugin</artifactId>
   <packaging>maven-plugin</packaging>
-  <version>1.6.0.dev</version>
+  <version>1.6.1</version>
   <name>JRuby Rake Plugin</name>
   <dependencies>
     <dependency>
@@ -31,11 +31,13 @@
     <dependency>
       <groupId>org.jruby</groupId>
       <artifactId>jruby-complete</artifactId>
-      <version>1.6.0.dev</version>
+      <version>1.6.1</version>
     </dependency>
   </dependencies>
 
   <build>
+    <sourceDirectory>src/main/java</sourceDirectory>
+    <outputDirectory>target/classes</outputDirectory>
     <plugins>
       <plugin>
         <artifactId>maven-plugin-plugin</artifactId>
@@ -44,6 +46,19 @@
           <!-- fully qualified name on the command line -->
           <goalPrefix>jruby-rake</goalPrefix>
         </configuration>
+      </plugin>
+      <!-- overwrite the configuration from the reactor pom -->
+      <plugin>
+	<artifactId>maven-compiler-plugin</artifactId>
+	<configuration>
+	  <excludes><exclude>none</exclude></excludes>
+	</configuration>
+      </plugin>
+      <plugin>
+	<artifactId>maven-jar-plugin</artifactId>
+	<configuration>
+	  <excludes><exclude>none</exclude></excludes>
+	</configuration>
       </plugin>
     </plugins>
   </build>

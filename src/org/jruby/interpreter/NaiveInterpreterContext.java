@@ -5,17 +5,16 @@
 
 package org.jruby.interpreter;
 
-import java.util.HashMap;
-import java.util.Map;
 import org.jruby.Ruby;
-import org.jruby.parser.StaticScope;
 import org.jruby.runtime.Block;
 import org.jruby.runtime.DynamicScope;
 import org.jruby.runtime.Frame;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.RubyException;
 
 import org.jruby.compiler.ir.IRMethod;
+import org.jruby.compiler.ir.operands.Label;
 
 /**
  *
@@ -29,22 +28,26 @@ public class NaiveInterpreterContext implements InterpreterContext {
     protected IRubyObject[] parameters;
     protected Object[] temporaryVariables;
     protected Object[] renamedVariables;
-    protected Map localVariables;
+    protected Object[] localVariables;
     protected Frame frame;
     protected Block block;
     protected DynamicScope currDynScope = null;
     protected boolean allocatedDynScope = false;
+    protected RubyException currException = null;
 
-    public NaiveInterpreterContext(ThreadContext context, IRubyObject self, int temporaryVariableSize, int renamedVariableSize, IRubyObject[] parameters, StaticScope staticScope, Block block) {
+    private Label methodExitLabel = null;
+
+    public NaiveInterpreterContext(ThreadContext context, IRubyObject self, int localVariablesSize, int temporaryVariablesSize, int renamedVariablesSize, IRubyObject[] parameters, Block block) {
         context.preMethodFrameOnly(self.getMetaClass(), null, self, block);
+        this.frame = context.getCurrentFrame();
 
         this.context = context;
         this.runtime = context.getRuntime();
         this.self = self;
         this.parameters = parameters;
-        this.temporaryVariables = new Object[temporaryVariableSize];
-        this.renamedVariables = new Object[renamedVariableSize];
-        this.localVariables = new HashMap();
+        this.localVariables = localVariablesSize > 0 ? new Object[localVariablesSize] : null;
+        this.temporaryVariables = temporaryVariablesSize > 0 ? new Object[temporaryVariablesSize] : null;
+        this.renamedVariables = renamedVariablesSize > 0 ? new Object[renamedVariablesSize] : null;
         this.block = block;
     }
 
@@ -100,11 +103,20 @@ public class NaiveInterpreterContext implements InterpreterContext {
         return oldValue;
     }
 
+    // Post-inlining
     public void updateRenamedVariablesCount(int n) {
         // SSS FIXME: use System.arraycopy
         Object[] oldRenamedVars = this.renamedVariables;
         this.renamedVariables = new Object[n];
         for (int i = 0; i < oldRenamedVars.length; i++) this.renamedVariables[i] = oldRenamedVars[i];
+    }
+
+    // Post-inlining
+    public void updateLocalVariablesCount(int n) {
+        // SSS FIXME: use System.arraycopy
+        Object[] oldLocalVars = this.localVariables;
+        this.localVariables = new Object[n];
+        for (int i = 0; i < oldLocalVars.length; i++) this.localVariables[i] = oldLocalVars[i];
     }
 
     public Object getRenamedVariable(int offset) {
@@ -117,30 +129,26 @@ public class NaiveInterpreterContext implements InterpreterContext {
         return oldValue;
     }
 
-    public Object getSharedBindingVariable(IRMethod irMethod, String varName) {
-        // SSS: This is actually dynamic scope variable -- badly named in the IR
-        // Object value = getFrameVariableMap(irMethod).get(varNameame);
-        int slot = irMethod.getBindingSlot(varName);
-//        System.out.println("LOAD: location for " + varName + " is " + slot);
-        Object value = currDynScope.getValue(slot, 0);
+    public Object getSharedBindingVariable(int bindingSlot) {
+        Object value = currDynScope.getValue(bindingSlot, 0);
         if (value == null) value = getRuntime().getNil();
         return value;
     }
 
-    public void setSharedBindingVariable(IRMethod irMethod, String varName, Object value) {
-        // SSS: This is actually dynamic scope variable -- badly named in the IR
-        // getFrameVariableMap(irMethod).put(varNameame, value);
-        int slot = irMethod.getBindingSlot(varName);
-//        System.out.println("STORE: location for " + varName + " is " + slot);
-        currDynScope.setValue(slot, (IRubyObject)value, 0);
+    public void setSharedBindingVariable(int bindingSlot, Object value) {
+        currDynScope.setValueDepthZero((IRubyObject)value, bindingSlot);
     }
 
-    public Object getLocalVariable(String name) {
-        Object value = localVariables.get(name);
+    public Object getLocalVariable(int offset) {
+        return localVariables[offset];
+    }
 
-        if (value == null) value = getRuntime().getNil();
+    public Object setLocalVariable(int offset, Object value) {
+        Object oldValue = localVariables[offset];
 
-        return value;
+        localVariables[offset] = value;
+
+        return oldValue;
     }
 
     public ThreadContext getContext() {
@@ -153,11 +161,6 @@ public class NaiveInterpreterContext implements InterpreterContext {
 
     public int getParameterCount() {
         return parameters.length;
-    }
-
-    public Object setLocalVariable(String name, Object value) {
-        localVariables.put(name, value);
-        return value;
     }
 
     public Object getSelf() {
@@ -175,16 +178,33 @@ public class NaiveInterpreterContext implements InterpreterContext {
     private IRubyObject[] NO_PARAMS = new IRubyObject[0];
 
     public IRubyObject[] getParametersFrom(int argIndex) {
-        argIndex -= 1;
-
         int length = parameters.length - argIndex;
-        if (length < 0) {
-            return NO_PARAMS;
-        }
+        
+        if (length <= 0) return NO_PARAMS;
 
         IRubyObject[] args = new IRubyObject[length];
         System.arraycopy(parameters, argIndex, args, 0, length);
 
         return args;
+    }
+
+    public void setMethodExitLabel(Label l) {
+        methodExitLabel = l;
+    }
+
+    public Label getMethodExitLabel() {
+        return methodExitLabel;
+    }
+
+    // Set the most recently raised exception
+    public void setException(RubyException e) {
+        // SSS FIXME: More things to be done besides this
+        currException = e;
+    }
+
+    // SSS FIXME: Should we get-and-clear instead of just get?
+    // Get the most recently raised exception
+    public RubyException getException() {
+        return currException;
     }
 }

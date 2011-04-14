@@ -20,6 +20,7 @@
  * Copyright (C) 2006 Kresten Krab Thorup <krab@gnu.org>
  * Copyright (C) 2007 Miguel Covarrubias <mlcovarrubias@gmail.com>
  * Copyright (C) 2007 William N Dortch <bill.dortch@gmail.com>
+ * Copyright (C) 2011 David Pollak <feeder.of.the.bears@gmail.com>
  * 
  * Alternatively, the contents of this file may be used under the terms of
  * either of the GNU General Public License Version 2 or later (the "GPL"),
@@ -37,6 +38,7 @@ package org.jruby.javasupport;
 
 import org.jruby.java.invokers.StaticFieldGetter;
 import org.jruby.java.invokers.StaticMethodInvoker;
+import org.jruby.java.invokers.SingletonMethodInvoker;
 import org.jruby.java.invokers.InstanceFieldGetter;
 import org.jruby.java.invokers.InstanceFieldSetter;
 import org.jruby.java.invokers.InstanceMethodInvoker;
@@ -50,13 +52,13 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ReflectPermission;
-import java.security.AccessControlException;
 import java.security.AccessController;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -86,7 +88,6 @@ import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.Visibility;
 import static org.jruby.runtime.Visibility.*;
-import static org.jruby.internal.runtime.methods.CallConfiguration.*;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.runtime.callback.Callback;
 import org.jruby.util.ByteList;
@@ -97,6 +98,7 @@ import org.jruby.util.SafePropertyAccessor;
 @JRubyClass(name="Java::JavaClass", parent="Java::JavaObject")
 public class JavaClass extends JavaObject {
     public static final String METHOD_MANGLE = "__method";
+    public static final boolean DEBUG_SCALA = false;
 
     public static final boolean CAN_SET_ACCESSIBLE;
 
@@ -120,6 +122,67 @@ public class JavaClass extends JavaObject {
         }
 
         CAN_SET_ACCESSIBLE = canSetAccessible;
+    }
+
+    private void handleScalaSingletons(Class<?> javaClass, InitializerState state) {
+        // check for Scala companion object
+        try {
+            Class<?> companionClass = javaClass.getClassLoader().loadClass(javaClass.getName() + "$");
+            Field field = companionClass.getField("MODULE$");
+            Object singleton = field.get(null);
+            if (singleton != null) {
+                Method[] sMethods = getMethods(companionClass);
+                for (int j = sMethods.length; j-- >= 0;) {
+                    Method method = sMethods[j];
+                    String name = method.getName();
+                    if (DEBUG_SCALA) {
+                        System.out.println("Companion object method " + name + " for " + companionClass);
+                    }
+                    if (name.indexOf("$") >= 0) {
+                        name = fixScalaNames(name);
+                    }
+                    if (!Modifier.isStatic(method.getModifiers())) {
+                        AssignedName assignedName = state.staticNames.get(name);
+                        // For JRUBY-4505, restore __method methods for reserved names
+                        if (INSTANCE_RESERVED_NAMES.containsKey(method.getName())) {
+                            if (DEBUG_SCALA) {
+                                System.out.println("in reserved " + name);
+                            }
+                            installSingletonMethods(state.staticCallbacks, javaClass, singleton, method, name + METHOD_MANGLE);
+                            continue;
+                        }
+                        if (assignedName == null) {
+                            state.staticNames.put(name, new AssignedName(name, Priority.METHOD));
+                            if (DEBUG_SCALA) {
+                                System.out.println("Assigned name is null");
+                            }
+                        } else {
+                            if (Priority.METHOD.lessImportantThan(assignedName)) {
+                                if (DEBUG_SCALA) {
+                                    System.out.println("Less important");
+                                }
+                                continue;
+                            }
+                            if (!Priority.METHOD.asImportantAs(assignedName)) {
+                                state.staticCallbacks.remove(name);
+                                state.staticCallbacks.remove(name + '=');
+                                state.staticNames.put(name, new AssignedName(name, Priority.METHOD));
+                            }
+                        }
+                        if (DEBUG_SCALA) {
+                            System.out.println("Installing " + name + " " + method + " " + singleton);
+                        }
+                        installSingletonMethods(state.staticCallbacks, javaClass, singleton, method, name);
+                    } else {
+                        if (DEBUG_SCALA) {
+                            System.out.println("Method " + method + " is sadly static");
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ignore... there's no companion object
+        }
     }
     
     /**
@@ -351,6 +414,27 @@ public class JavaClass extends JavaObject {
                 singleton.addMethod(name, method);
                 if (aliases != null && isPublic() ) {
                     singleton.defineAliases(aliases, this.name);
+                    aliases = null;
+                }
+            }
+        }
+    }
+
+    private static class SingletonMethodInvokerInstaller extends StaticMethodInvokerInstaller {
+        private Object singleton;
+
+        SingletonMethodInvokerInstaller(String name, Object singleton) {
+            super(name);
+            this.singleton = singleton;
+        }
+
+        void install(RubyModule proxy) {
+            if (hasLocalMethod()) {
+                RubyClass rubySingleton = proxy.getSingletonClass();
+                DynamicMethod method = new SingletonMethodInvoker(this.singleton, rubySingleton, methods);
+                rubySingleton.addMethod(name, method);
+                if (aliases != null && isPublic()) {
+                    rubySingleton.defineAliases(aliases, this.name);
                     aliases = null;
                 }
             }
@@ -644,6 +728,14 @@ public class JavaClass extends JavaObject {
             Class<?> resultType = method.getReturnType();
             int argCount = argTypes.length;
 
+            // Add scala aliases for apply/update to roughly equivalent Ruby names
+            if (rubyCasedName.equals("apply")) {
+                addUnassignedAlias("[]", assignedNames, installer);
+            }
+            if (rubyCasedName.equals("update") && argCount == 2) {
+                addUnassignedAlias("[]=", assignedNames, installer);
+            }
+
             // Add property name aliases
             if (javaPropertyName != null) {
                 if (rubyCasedName.startsWith("get_")) {
@@ -811,6 +903,38 @@ public class JavaClass extends JavaObject {
         }
     }
 
+    private static String fixScalaNames(String name) {
+        for (Map.Entry<String, String> entry : SCALA_OPERATORS.entrySet()) {
+            name.replaceAll(entry.getKey(), entry.getValue());
+        }
+
+        return name;
+    }
+
+    private static final Map<String, String> SCALA_OPERATORS;
+    static {
+        Map<String, String> tmp = new HashMap();
+        tmp.put("$plus", "+");
+        tmp.put("$minus", "-");
+        tmp.put("$colon", ":");
+        tmp.put("$div", "/");
+        tmp.put("$eq", "=");
+        tmp.put("$less", "<");
+        tmp.put("$greater", ">");
+        tmp.put("$bslash", "\\");
+        tmp.put("$hash", "#");
+        tmp.put("$times", "*");
+        tmp.put("$bang", "!");
+        tmp.put("$at", "@");
+        tmp.put("$percent", "%");
+        tmp.put("$up", "^");
+        tmp.put("$amp", "&");
+        tmp.put("$tilde", "~");
+        tmp.put("$qmark", "?");
+        tmp.put("$bar", "|");
+        SCALA_OPERATORS = Collections.unmodifiableMap(tmp);
+    }
+
     private void setupClassMethods(Class<?> javaClass, InitializerState state) {
         // TODO: protected methods.  this is going to require a rework of some of the mechanism.
         Method[] methods = getMethods(javaClass);
@@ -820,6 +944,11 @@ public class JavaClass extends JavaObject {
             // install the ones that are named in this class
             Method method = methods[i];
             String name = method.getName();
+
+            // Fix Scala names to be their Ruby equivalents
+            if (name.startsWith("$")) {
+                name = fixScalaNames(name);
+            }
 
             if (Modifier.isStatic(method.getModifiers())) {
                 AssignedName assignedName = state.staticNames.get(name);
@@ -864,6 +993,9 @@ public class JavaClass extends JavaObject {
             }
         }
 
+        // try to wire up Scala singleton logic if present
+        handleScalaSingletons(javaClass, state);
+
         // now iterate over all installers and make sure they also have appropriate aliases
         for (Map.Entry<String, NamedInstaller> entry : state.staticCallbacks.entrySet()) {
             // no aliases for __method methods
@@ -896,6 +1028,15 @@ public class JavaClass extends JavaObject {
         MethodInstaller invoker = (MethodInstaller) methodCallbacks.get(name);
         if (invoker == null) {
             invoker = new StaticMethodInvokerInstaller(name);
+            methodCallbacks.put(name, invoker);
+        }
+        invoker.addMethod(method, javaClass);
+    }
+    
+    private void installSingletonMethods(Map<String, NamedInstaller> methodCallbacks, Class<?> javaClass, Object singleton, Method method, String name) {
+        MethodInstaller invoker = (MethodInstaller) methodCallbacks.get(name);
+        if (invoker == null) {
+            invoker = new SingletonMethodInvokerInstaller(name, singleton);
             methodCallbacks.put(name, invoker);
         }
         invoker.addMethod(method, javaClass);
@@ -1900,18 +2041,18 @@ public class JavaClass extends JavaObject {
     
     private static boolean methodsAreEquivalent(Method child, Method parent) {
         return parent.getDeclaringClass().isAssignableFrom(child.getDeclaringClass())
-                && Arrays.equals(child.getParameterTypes(), parent.getParameterTypes())
                 && child.getReturnType() == parent.getReturnType()
                 && child.isVarArgs() == parent.isVarArgs()
                 && Modifier.isPublic(child.getModifiers()) == Modifier.isPublic(parent.getModifiers())
                 && Modifier.isProtected(child.getModifiers()) == Modifier.isProtected(parent.getModifiers())
-                && Modifier.isStatic(child.getModifiers()) == Modifier.isStatic(parent.getModifiers());
+                && Modifier.isStatic(child.getModifiers()) == Modifier.isStatic(parent.getModifiers())
+                && Arrays.equals(child.getParameterTypes(), parent.getParameterTypes());
     }
-
-
-    private static void addNewMethods(HashMap<String, List<Method>> nameMethods, Method[] methods, boolean includeStatic, boolean removeDuplicate) {
+    
+    private static int addNewMethods(HashMap<String, List<Method>> nameMethods, Method[] methods, boolean includeStatic, boolean removeDuplicate) {
+        int added = 0;
         Methods: for (Method m : methods) {
-            if (Modifier.isStatic(m.getModifiers()) && !includeStatic) {
+            if (!includeStatic && Modifier.isStatic(m.getModifiers())) {
                 // Skip static methods if we're not suppose to include them.
                 // Generally for superclasses; we only bind statics from the actual
                 // class.
@@ -1920,21 +2061,22 @@ public class JavaClass extends JavaObject {
             List<Method> childMethods = nameMethods.get(m.getName());
             if (childMethods == null) {
                 // first method of this name, add a collection for it
-                childMethods = new ArrayList<Method>();
+                childMethods = new ArrayList<Method>(1);
                 childMethods.add(m);
                 nameMethods.put(m.getName(), childMethods);
+                added++;
             } else {
                 // we have seen other methods; check if we already have
                 // an equivalent one
-                for (Method m2 : childMethods) {
+                for (ListIterator<Method> iter = childMethods.listIterator(); iter.hasNext();) {
+                    Method m2 = iter.next();
                     if (methodsAreEquivalent(m2, m)) {
                         if (removeDuplicate) {
                             // Replace the existing method, since the super call is more general
                             // and virtual dispatch will call the subclass impl anyway.
                             // Used for instance methods, for which we usually want to use the highest-up
                             // callable implementation.
-                            childMethods.remove(m2);
-                            childMethods.add(m);
+                            iter.set(m);
                         } else {
                             // just skip the new method, since we don't need it (already found one)
                             // used for interface methods, which we want to add unconditionally
@@ -1945,13 +2087,18 @@ public class JavaClass extends JavaObject {
                 }
                 // no equivalent; add it
                 childMethods.add(m);
+                added++;
             }
         }
+        return added;
     }
     
-    private static Method[] getMethods(Class<?> javaClass) {
-        HashMap<String, List<Method>> nameMethods = new HashMap<String, List<Method>>();
+    public static Method[] getMethods(Class<?> javaClass) {
+        HashMap<String, List<Method>> nameMethods = new HashMap<String, List<Method>>(30);
 
+        // to better size the final ArrayList below
+        int total = 0;
+        
         // we scan all superclasses, but avoid adding superclass methods with
         // same name+signature as subclass methods (see JRUBY-3130)
         for (Class c = javaClass; c != null; c = c.getSuperclass()) {
@@ -1962,7 +2109,7 @@ public class JavaClass extends JavaObject {
                 try {
                     // add methods, including static if this is the actual class,
                     // and replacing child methods with equivalent parent methods
-                    addNewMethods(nameMethods, c.getDeclaredMethods(), c == javaClass, true);
+                    total += addNewMethods(nameMethods, c.getDeclaredMethods(), c == javaClass, true);
                 } catch (SecurityException e) {
                 }
             }
@@ -1973,14 +2120,14 @@ public class JavaClass extends JavaObject {
                     // add methods, not including static (should be none on
                     // interfaces anyway) and not replacing child methods with
                     // parent methods
-                    addNewMethods(nameMethods, i.getMethods(), false, false);
+                    total += addNewMethods(nameMethods, i.getMethods(), false, false);
                 } catch (SecurityException e) {
                 }
             }
         }
         
         // now only bind the ones that remain
-        ArrayList<Method> finalList = new ArrayList<Method>();
+        ArrayList<Method> finalList = new ArrayList<Method>(total);
 
         for (Map.Entry<String, List<Method>> entry : nameMethods.entrySet()) {
             finalList.addAll(entry.getValue());

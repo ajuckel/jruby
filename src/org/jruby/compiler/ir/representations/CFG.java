@@ -25,8 +25,8 @@ import org.jruby.compiler.ir.instructions.JumpInstr;
 import org.jruby.compiler.ir.instructions.JUMP_INDIRECT_Instr;
 import org.jruby.compiler.ir.instructions.LABEL_Instr;
 import org.jruby.compiler.ir.instructions.MethodLookupInstr;
-import org.jruby.compiler.ir.instructions.RESCUED_BODY_START_MARKER_Instr;
-import org.jruby.compiler.ir.instructions.RESCUED_BODY_END_MARKER_Instr;
+import org.jruby.compiler.ir.instructions.ExceptionRegionStartMarkerInstr;
+import org.jruby.compiler.ir.instructions.ExceptionRegionEndMarkerInstr;
 import org.jruby.compiler.ir.instructions.ReturnInstr;
 import org.jruby.compiler.ir.instructions.SET_RETADDR_Instr;
 import org.jruby.compiler.ir.instructions.THROW_EXCEPTION_Instr;
@@ -36,6 +36,7 @@ import org.jruby.compiler.ir.operands.Label;
 import org.jruby.compiler.ir.operands.MetaObject;
 import org.jruby.compiler.ir.operands.Operand;
 import org.jruby.compiler.ir.operands.Variable;
+import org.jruby.compiler.ir.operands.LocalVariable;
 
 import org.jruby.compiler.ir.dataflow.DataFlowProblem;
 
@@ -70,10 +71,14 @@ public class CFG {
     LinkedList<BasicBlock>              _postOrderList; // Post order traversal list of the cfg
     Map<String, DataFlowProblem>        _dfProbs;       // Map of name -> dataflow problem
     Map<Label, BasicBlock>              _bbMap;         // Map of label -> basic blocks with that label
-    Map<Integer, BasicBlock>            _fallThruMap;   // Map of basic block id -> fall thru basic block
+    BasicBlock[]                        _fallThruMap;   // Map of basic block id -> fall thru basic block
     List<BasicBlock>                    _linearizedBBList;  // Linearized list of bbs
     Map<BasicBlock, BasicBlock>         _bbRescuerMap;  // Map of bb -> first bb of the rescue block that initiates exception handling for all exceptions thrown within this bb
-    List<RescuedRegion>                 _outermostRRs;  // Outermost rescued regions
+    List<ExceptionRegion>               _outermostERs;  // Outermost exception regions
+
+    private Instr[]       _instrs;
+    private Set<Variable> _definedLocalVars;  // Local variables defined in this scope
+    private Set<Variable> _usedLocalVars;     // Local variables used in this scope
 
     public CFG(IRExecutionScope s) {
         _nextBBId = 0; // Init before building basic blocks below!
@@ -81,8 +86,9 @@ public class CFG {
         _postOrderList = null;
         _dfProbs = new HashMap<String, DataFlowProblem>();
         _bbMap = new HashMap<Label, BasicBlock>();
-        _outermostRRs = new ArrayList<RescuedRegion>();
+        _outermostERs = new ArrayList<ExceptionRegion>();
         _bbRescuerMap = new HashMap<BasicBlock, BasicBlock>();
+        _instrs = null;
     }
 
     public DirectedGraph getGraph() {
@@ -127,32 +133,45 @@ public class CFG {
         return _cfg.vertexSet();
     }
 
-    // SSS FIXME: This is only valid temporarily while the cfg blocks
-    // haven't been reordered around.  This code is there temporarily
-    // to get Tom & Charlie started on the IR interpreter.
-    public BasicBlock getFallThroughBB(BasicBlock bb) {
-        return _fallThruMap.get(bb.getID());
-    }
-
     public BasicBlock getTargetBB(Label l) {
         return _bbMap.get(l);
+    }
+
+    // SSS: For now, do this with utmost inefficiency!
+    // This keeps regular code execution fast.
+    public int getRescuerPC(Instr excInstr) {
+        for (BasicBlock b: _linearizedBBList) {
+            for (Instr i: b.getInstrs()) {
+                if (i == excInstr) {
+                    BasicBlock rescuerBB = _bbRescuerMap.get(b);
+                    if (rescuerBB == null)
+                        return -1;
+                    else
+                        return rescuerBB.getLabel().getTargetPC();
+                }
+            }
+        }
+
+        // SSS FIXME: Cannot happen! Throw runtime exception
+        System.err.println("Fell through looking for rescuer ipc for " + excInstr);
+        return -1;
     }
 
     private Label getNewLabel() {
         return _scope.getNewLabel();
     }
 
-    private BasicBlock createNewBB(Label l, DirectedGraph<BasicBlock, CFG_Edge> g, Map<Label, BasicBlock> bbMap, Stack<RescuedRegion> nestedRescuedRegions) {
+    private BasicBlock createNewBB(Label l, DirectedGraph<BasicBlock, CFG_Edge> g, Map<Label, BasicBlock> bbMap, Stack<ExceptionRegion> nestedExceptionRegions) {
         BasicBlock b = new BasicBlock(this, l);
         bbMap.put(b._label, b);
         g.addVertex(b);
-        if (!nestedRescuedRegions.empty())
-            nestedRescuedRegions.peek().addBB(b);
+        if (!nestedExceptionRegions.empty())
+            nestedExceptionRegions.peek().addBB(b);
         return b;
     }
 
-    private BasicBlock createNewBB(DirectedGraph<BasicBlock, CFG_Edge> g, Map<Label, BasicBlock> bbMap, Stack<RescuedRegion> nestedRescuedRegions) {
-        return createNewBB(getNewLabel(), g, bbMap, nestedRescuedRegions);
+    private BasicBlock createNewBB(DirectedGraph<BasicBlock, CFG_Edge> g, Map<Label, BasicBlock> bbMap, Stack<ExceptionRegion> nestedExceptionRegions) {
+        return createNewBB(getNewLabel(), g, bbMap, nestedExceptionRegions);
     }
 
     private void removeBB(BasicBlock b) {
@@ -184,12 +203,50 @@ public class CFG {
                     });
     }
 
+    public Instr[] prepareForInterpretation() {
+        if (_instrs != null) // Done
+            return _instrs;
+
+        List<Instr> instrs = new ArrayList<Instr>();
+        List<BasicBlock> bbs = linearize();
+
+        // Set up a bb array that maps labels to targets -- just to make sure old code continues to work! 
+        setupFallThruMap();
+
+        // Set up IPCs
+        HashMap<Label, Integer> labelIPCMap = new HashMap<Label, Integer>();
+        List<Label> labelsToFixup = new ArrayList<Label>();
+        int ipc = 0;
+        for (BasicBlock b: bbs) {
+            labelIPCMap.put(b.getLabel(), ipc);
+            labelsToFixup.add(b.getLabel());
+            for (Instr i: b.getInstrs()) {
+                instrs.add(i);
+                ipc++;
+            }
+        }
+
+        // Fix up labels
+        for (Label l: labelsToFixup) {
+            l.setTargetPC(labelIPCMap.get(l));
+        }
+
+        // Exit BB ipc
+        getExitBB().getLabel().setTargetPC(ipc+1);
+
+        _instrs = instrs.toArray(new Instr[instrs.size()]);
+        return _instrs;
+    }
+
+    public Instr[] getInstrArray() { return _instrs; }
+
     public void build(List<Instr> instrs) {
         // Map of label & basic blocks which are waiting for a bb with that label
         Map<Label, List<BasicBlock>> forwardRefs = new HashMap<Label, List<BasicBlock>>();
 
         // Map of return address variable and all possible targets (required to connect up ensure blocks with their targets)
         Map<Variable, Set<Label>> retAddrMap = new HashMap<Variable, Set<Label>>();
+        Map<Variable, BasicBlock> retAddrTargetMap = new HashMap<Variable, BasicBlock>();
 
         // List of bbs that have a 'return' instruction
         List<BasicBlock> retBBs = new ArrayList<BasicBlock>();
@@ -198,18 +255,18 @@ public class CFG {
         List<BasicBlock> excBBs = new ArrayList<BasicBlock>();
 
         // Stack of nested rescue regions
-        Stack<RescuedRegion> nestedRescuedRegions = new Stack<RescuedRegion>();
+        Stack<ExceptionRegion> nestedExceptionRegions = new Stack<ExceptionRegion>();
 
         // List of all rescued regions
-        List<RescuedRegion> allRescuedRegions = new ArrayList<RescuedRegion>();
+        List<ExceptionRegion> allExceptionRegions = new ArrayList<ExceptionRegion>();
 
         DirectedGraph<BasicBlock, CFG_Edge> g = getNewCFG();
 
         // Dummy entry basic block (see note at end to see why)
-        _entryBB = createNewBB(g, _bbMap, nestedRescuedRegions);
+        _entryBB = createNewBB(g, _bbMap, nestedExceptionRegions);
 
         // First real bb
-        BasicBlock firstBB = createNewBB(g, _bbMap, nestedRescuedRegions);
+        BasicBlock firstBB = createNewBB(g, _bbMap, nestedExceptionRegions);
 
         // Build the rest!
         BasicBlock prevBB = null;
@@ -222,7 +279,7 @@ public class CFG {
             if (iop == Operation.LABEL) {
                 Label l = ((LABEL_Instr) i)._lbl;
                 prevBB = currBB;
-                newBB = createNewBB(l, g, _bbMap, nestedRescuedRegions);
+                newBB = createNewBB(l, g, _bbMap, nestedExceptionRegions);
                 if (!bbEndedWithControlXfer) // Jump instruction bbs dont add an edge to the succeeding bb by default
                 {
                     g.addEdge(currBB, newBB);
@@ -238,9 +295,9 @@ public class CFG {
                 }
                 bbEnded = false;
                 bbEndedWithControlXfer = false;
-            } else if (bbEnded && (iop != Operation.RESCUE_BODY_END)) {
+            } else if (bbEnded && (iop != Operation.EXC_REGION_END)) {
                 prevBB = currBB;
-                newBB = createNewBB(g, _bbMap, nestedRescuedRegions);
+                newBB = createNewBB(g, _bbMap, nestedExceptionRegions);
                 if (!bbEndedWithControlXfer) // Jump instruction bbs dont add an edge to the succeeding bb by default
                 {
                     g.addEdge(currBB, newBB); // currBB cannot be null!
@@ -250,24 +307,24 @@ public class CFG {
                 bbEndedWithControlXfer = false;
             }
 
-            if (i instanceof RESCUED_BODY_START_MARKER_Instr) {
+            if (i instanceof ExceptionRegionStartMarkerInstr) {
 // SSS: Do we need this anymore?
 //                currBB.addInstr(i);
-                RESCUED_BODY_START_MARKER_Instr rbsmi = (RESCUED_BODY_START_MARKER_Instr)i;
-                RescuedRegion rr = new RescuedRegion(rbsmi._elseBlock, rbsmi._rescueBlockLabels);
+                ExceptionRegionStartMarkerInstr rbsmi = (ExceptionRegionStartMarkerInstr)i;
+                ExceptionRegion rr = new ExceptionRegion(rbsmi._rescueBlockLabels);
                 rr.addBB(currBB);
-                allRescuedRegions.add(rr);
+                allExceptionRegions.add(rr);
 
-                if (nestedRescuedRegions.empty())
-                    _outermostRRs.add(rr);
+                if (nestedExceptionRegions.empty())
+                    _outermostERs.add(rr);
                 else
-                    nestedRescuedRegions.peek().addNestedRegion(rr);
+                    nestedExceptionRegions.peek().addNestedRegion(rr);
 
-                nestedRescuedRegions.push(rr);
-            } else if (i instanceof RESCUED_BODY_END_MARKER_Instr) {
+                nestedExceptionRegions.push(rr);
+            } else if (i instanceof ExceptionRegionEndMarkerInstr) {
 // SSS: Do we need this anymore?
 //                currBB.addInstr(i);
-                nestedRescuedRegions.pop().setEndBB(currBB);
+                nestedExceptionRegions.pop().setEndBB(currBB);
             } else if (iop.endsBasicBlock()) {
                 bbEnded = true;
                 currBB.addInstr(i);
@@ -284,6 +341,7 @@ public class CFG {
                 } // SSS FIXME: To be done
                 else if (i instanceof BREAK_Instr) {
                     tgt = null;
+                    retBBs.add(currBB); // the break instruction transfers control to the end of this closure cfg
                     bbEndedWithControlXfer = true;
                 } else if (i instanceof ReturnInstr) {
                     tgt = null;
@@ -296,10 +354,12 @@ public class CFG {
                 } else if (i instanceof JUMP_INDIRECT_Instr) {
                     tgt = null;
                     bbEndedWithControlXfer = true;
-                    Set<Label> retAddrs = retAddrMap.get(((JUMP_INDIRECT_Instr) i)._target);
+                    Set<Label> retAddrs = retAddrMap.get(((JUMP_INDIRECT_Instr) i).getJumpTarget());
                     for (Label l : retAddrs) {
                         addEdge(g, currBB, l, _bbMap, forwardRefs);
                     }
+                    // Record the target bb for the retaddr var for any set_addr instrs that appear later and use the same retaddr var
+                    retAddrTargetMap.put(((JUMP_INDIRECT_Instr) i).getJumpTarget(), currBB);
                 } else {
                     tgt = null;
                 }
@@ -312,13 +372,22 @@ public class CFG {
             }
 
             if (i instanceof SET_RETADDR_Instr) {
-                Variable v = i.getResult();
-                Set<Label> addrs = retAddrMap.get(v);
-                if (addrs == null) {
-                    addrs = new HashSet<Label>();
-                    retAddrMap.put(v, addrs);
+                Variable   v  = i.getResult();
+                Label      tgtLbl = ((SET_RETADDR_Instr) i).getReturnAddr();
+                BasicBlock tgtBB  = retAddrTargetMap.get(v); 
+                // If we have the target bb, add the edge
+                // If not, record it for fixup later
+                if (tgtBB != null) {
+                    addEdge(g, tgtBB, tgtLbl, _bbMap, forwardRefs);
                 }
-                addrs.add(((SET_RETADDR_Instr) i).getReturnAddr());
+                else {
+                   Set<Label> addrs = retAddrMap.get(v);
+                   if (addrs == null) {
+                       addrs = new HashSet<Label>();
+                       retAddrMap.put(v, addrs);
+                   }
+                   addrs.add(tgtLbl);
+                }
             } else if (i instanceof CallInstr) { // Build CFG for the closure if there exists one
                 Operand closureArg = ((CallInstr)i).getClosureArg();
                 if (closureArg instanceof MetaObject) {
@@ -328,7 +397,7 @@ public class CFG {
         }
 
         // Process all rescued regions
-        for (RescuedRegion rr: allRescuedRegions) {
+        for (ExceptionRegion rr: allExceptionRegions) {
             BasicBlock firstRescueBB = getTargetBB(rr.getFirstRescueBlockLabel());
 
             // 1. Tell the region that firstRescueBB is its protector!
@@ -339,7 +408,7 @@ public class CFG {
             for (BasicBlock b: rr._exclusiveBBs) {
                 _bbRescuerMap.put(b, firstRescueBB);
                 g.addEdge(b, firstRescueBB)._type = CFG_Edge_Type.EXCEPTION_EDGE;
-				}
+            }
         }
 
         // Dummy entry and exit basic blocks and other dummy edges are needed to maintain the CFG 
@@ -353,7 +422,7 @@ public class CFG {
         // * all return bbs to the exit bb
         // * all exception bbs to the exit bb (mark these exception edges)
         // * last bb     -> dummy exit (only if the last bb didn't end with a control transfer!
-        _exitBB = createNewBB(g, _bbMap, nestedRescuedRegions);
+        _exitBB = createNewBB(g, _bbMap, nestedExceptionRegions);
         g.addEdge(_entryBB, _exitBB)._type = CFG_Edge_Type.DUMMY_EDGE;
         g.addEdge(_entryBB, firstBB)._type = CFG_Edge_Type.DUMMY_EDGE;
         for (BasicBlock rb : retBBs) {
@@ -368,11 +437,8 @@ public class CFG {
 
         _cfg = g;
 
-        // Delete orphaned (with no incoming edges) blocks
-        deleteOrphanedBlocks();
-
-        // Set up the bb array
-        setupFallThruMap();
+        // remove useless cfg edges & orphaned bbs
+        optimizeCFG();
     }
 
 /*
@@ -387,11 +453,11 @@ public class CFG {
 
     private void setupFallThruMap() {
         List<BasicBlock> bbs = linearize();
-        _fallThruMap = new HashMap<Integer, BasicBlock>();
+        _fallThruMap = new BasicBlock[1+getMaxNodeID()];
         BasicBlock prev = null;
         for (BasicBlock b: bbs) {
            if (prev != null)
-              _fallThruMap.put(prev.getID(), b);
+              _fallThruMap[prev.getID()] = b;
            prev = b;
         }
     }
@@ -473,8 +539,8 @@ public class CFG {
         }
 
         // 5. No need to clone rescued regions -- just assimilate them
-        for (RescuedRegion r: ccfg._outermostRRs) {
-            _outermostRRs.add(r);
+        for (ExceptionRegion r: ccfg._outermostERs) {
+            _outermostERs.add(r);
         }
 
         // 6. Update bb rescuer map
@@ -564,9 +630,9 @@ public class CFG {
             }
         }
 
-        // 5. Clone rescued regions
-        for (RescuedRegion r: mcfg._outermostRRs) {
-            _outermostRRs.add(r.cloneForInlining(ii));
+        // 5. Clone exception regions
+        for (ExceptionRegion r: mcfg._outermostERs) {
+            _outermostERs.add(r.cloneForInlining(ii));
         }
 
         // 6. Update bb rescuer map
@@ -641,6 +707,16 @@ public class CFG {
             if (allChildrenDone) {
                 stack.pop();
                 _postOrderList.add(b);
+            }
+        }
+
+        // Sanity check!
+        for (BasicBlock b: getNodes()) {
+            if (!bbSet.get(b.getID())) {
+                System.out.println("BB " + b.getID() + " missing from po list!");
+                System.out.println("CFG: " + _cfg);
+                System.out.println("Instrs: " + toStringInstrs());
+                break;
             }
         }
     }
@@ -801,8 +877,8 @@ public class CFG {
     }
 
     public void deleteOrphanedBlocks() {
-		  // System.out.println("\nGraph:\n" + getGraph().toString());
-		  // System.out.println("\nInstructions:\n" + toStringInstrs());
+        // System.out.println("\nGraph:\n" + getGraph().toString());
+        // System.out.println("\nInstructions:\n" + toStringInstrs());
 
         // FIXME: Quick and dirty implementation
         while (true) {
@@ -820,44 +896,83 @@ public class CFG {
             }
             if (bbToRemove == null)
                 break;
-            else
+            else {
+//                System.out.println("Removing orphaned BB: " + bbToRemove);
                 removeBB(bbToRemove);
+            }
         }
     }
 
     public void splitCalls() {
+        // FIXME: (Enebo) We are going to make a SplitCallInstr so this logic can be separate
+        // from unsplit calls.  Comment out until new SplitCall is created.
+//        for (BasicBlock b: getNodes()) {
+//            List<Instr> bInstrs = b.getInstrs();
+//            for (ListIterator<Instr> it = ((ArrayList<Instr>)b.getInstrs()).listIterator(); it.hasNext(); ) {
+//                Instr i = it.next();
+//                // Only user calls, not Ruby & JRuby internal calls
+//                if (i.operation == Operation.CALL) {
+//                    CallInstr call = (CallInstr)i;
+//                    Operand   r    = call.getReceiver();
+//                    Operand   m    = call.getMethodAddr();
+//                    Variable  mh   = _scope.getNewTemporaryVariable();
+//                    MethodLookupInstr mli = new MethodLookupInstr(mh, m, r);
+//                    // insert method lookup at the right place
+//                    it.previous();
+//                    it.add(mli);
+//                    it.next();
+//                    // update call address
+//                    call.setMethodAddr(mh);
+//                }
+//            }
+//        }
+//
+//        List<IRClosure> closures = _scope.getClosures();
+//        if (!closures.isEmpty()) {
+//            for (IRClosure c : closures) {
+//                c.getCFG().splitCalls();
+//            }
+//        }
+    }
+
+    public void optimizeCFG() {
+        // SSS FIXME: Can't we not add some of these exception edges in the first place??
+        // Remove exception edges from blocks that couldn't possibly thrown an exception!
+        List<CFG_Edge> toRemove = new ArrayList<CFG_Edge>();
         for (BasicBlock b: getNodes()) {
-            List<Instr> bInstrs = b.getInstrs();
-            for (ListIterator<Instr> it = ((ArrayList<Instr>)b.getInstrs()).listIterator(); it.hasNext(); ) {
-                Instr i = it.next();
-					 // Only user calls, not Ruby & JRuby internal calls
-                if (i.operation == Operation.CALL) {
-                    CallInstr call = (CallInstr)i;
-                    Operand   r    = call.getReceiver();
-                    Operand   m    = call.getMethodAddr();
-                    Variable  mh   = _scope.getNewTemporaryVariable();
-                    MethodLookupInstr mli = new MethodLookupInstr(mh, m, r);
-                    // insert method lookup at the right place
-                    it.previous();
-                    it.add(mli);
-                    it.next();
-                    // update call address
-                    call.setMethodAddr(mh);
+            boolean noExceptions = true;
+            for (Instr i: b.getInstrs()) {
+                if (i.canRaiseException()) {
+                    noExceptions = false;
+                    break;
+                }
+            }
+
+            if (noExceptions) {
+//                System.out.println("No exceptions from bb: " + b.getID());
+                for (CFG_Edge e: _cfg.outgoingEdgesOf(b)) {
+                    if (e._type == CFG_Edge_Type.EXCEPTION_EDGE) {
+//                        System.out.println("Removing edge: " + e);
+                        toRemove.add(e);
+                        if (_bbRescuerMap.get(e._src) == e._dst)
+                            _bbRescuerMap.remove(e._src);
+                    }
                 }
             }
         }
 
-        List<IRClosure> closures = _scope.getClosures();
-        if (!closures.isEmpty()) {
-            for (IRClosure c : closures) {
-                c.getCFG().splitCalls();
-            }
-        }
+        if (!toRemove.isEmpty())
+            _cfg.removeAllEdges(toRemove);
+
+        deleteOrphanedBlocks();
     }
 
     public List<BasicBlock> linearize() {
+        if (_linearizedBBList != null) // Done!
+            return _linearizedBBList;
+
         _linearizedBBList = new ArrayList<BasicBlock>();
-       
+
         // Linearize the basic blocks of the cfg!
         // This is a simple linearization -- nothing fancy
         BasicBlock root = getEntryBB();
@@ -884,69 +999,68 @@ public class CFG {
                 assert stack.empty();
             }
             else {
-                assert !stack.empty();
+                // Find the basic block that is the target of the 'taken' branch
+                Instr lastInstr = b.getLastInstr();
+                if (lastInstr == null) {
+                    // Only possible for the root block with 2 edges + blocks with just 1 target with no instructions
+                    BasicBlock b1 = null, b2 = null; 
+                    for (CFG_Edge e: _cfg.outgoingEdgesOf(b)) {
+                        if (b1 == null)
+                            b1 = e._dst;
+                        else if (b2 == null)
+                            b2 = e._dst;
+                        else
+                            throw new RuntimeException("Encountered bb: " + b.getID() + " with no instrs. and more than 2 targets!!");
+                    }
 
-               // Find the basic block that is the target of the 'taken' branch
-               Instr lastInstr = b.getLastInstr();
-               if (lastInstr == null) {
-                   // Only possible for the root block with 2 edges + blocks with just 1 target with no instructions
-                   BasicBlock b1 = null, b2 = null; 
+                    assert (b1 != null);
+
+                    // Process lower number target first!
+                    if (b2 == null) {
+                        pushBBOnStack(stack, bbSet, b1);
+                    }
+                    else if (b1.getID() < b2.getID()) {
+                        pushBBOnStack(stack, bbSet, b2);
+                        pushBBOnStack(stack, bbSet, b1);
+                    }
+                    else {
+                        pushBBOnStack(stack, bbSet, b1);
+                        pushBBOnStack(stack, bbSet, b2);
+                    }
+                }
+                else {
+//                   System.out.println("last instr is: " + lastInstr);
+                   BasicBlock blockToIgnore = null;
+                   if (lastInstr instanceof JumpInstr) {
+                       blockToIgnore = _bbMap.get(((JumpInstr)lastInstr).target);
+
+                       // Check if all of blockToIgnore's predecessors get to it with a jump!
+                       // This can happen because of exceptions and rescue handlers
+                       // If so, dont ignore it.  Process it right away (because everyone will end up ignoring this block!)
+                       boolean allJumps = true;
+                       for (CFG_Edge e: _cfg.incomingEdgesOf(blockToIgnore)) {
+                           if (! (e._src.getLastInstr() instanceof JumpInstr))
+                               allJumps = false;
+                       }
+
+                       if (allJumps)
+                           blockToIgnore = null;
+                   }
+                   else if (lastInstr instanceof BranchInstr) {
+                       // Push the taken block onto the stack first so that it gets processed last!
+                       BasicBlock takenBlock = _bbMap.get(((BranchInstr)lastInstr).getJumpTarget());
+                       pushBBOnStack(stack, bbSet, takenBlock);
+                       blockToIgnore = takenBlock;
+                   }
+
+                   // Push everything else
                    for (CFG_Edge e: _cfg.outgoingEdgesOf(b)) {
-                       if (b1 == null)
-                           b1 = e._dst;
-                       else if (b2 == null)
-                           b2 = e._dst;
-                       else
-                           throw new RuntimeException("Encountered bb: " + b.getID() + " with no instrs. and more than 2 targets!!");
+                       BasicBlock x = e._dst;
+                       if (x != blockToIgnore)
+                           pushBBOnStack(stack, bbSet, x);
                    }
-
-                   assert (b1 != null);
-
-                   // Process lower number target first!
-                   if (b2 == null) {
-                       pushBBOnStack(stack, bbSet, b1);
-                   }
-                   else if (b1.getID() < b2.getID()) {
-                       pushBBOnStack(stack, bbSet, b2);
-                       pushBBOnStack(stack, bbSet, b1);
-                   }
-                   else {
-                       pushBBOnStack(stack, bbSet, b1);
-                       pushBBOnStack(stack, bbSet, b2);
-                   }
-               }
-               else {
-//                  System.out.println("last instr is: " + lastInstr);
-                  BasicBlock blockToIgnore = null;
-                  if (lastInstr instanceof JumpInstr) {
-                      blockToIgnore = _bbMap.get(((JumpInstr)lastInstr).target);
-
-                      // Check if all of blockToIgnore's predecessors get to it with a jump!
-                      // This can happen because of exceptions and rescue handlers
-                      // If so, dont ignore it.  Process it right away (because everyone will end up ignoring this block!)
-                      boolean allJumps = true;
-                      for (CFG_Edge e: _cfg.incomingEdgesOf(blockToIgnore)) {
-                          if (! (e._src.getLastInstr() instanceof JumpInstr))
-                              allJumps = false;
-                      }
-
-                      if (allJumps)
-                          blockToIgnore = null;
-                  }
-                  else if (lastInstr instanceof BranchInstr) {
-                      // Push the taken block onto the stack first so that it gets processed last!
-                      BasicBlock takenBlock = _bbMap.get(((BranchInstr)lastInstr).getJumpTarget());
-                      pushBBOnStack(stack, bbSet, takenBlock);
-                      blockToIgnore = takenBlock;
-                  }
-         
-                  // Push everything else
-                  for (CFG_Edge e: _cfg.outgoingEdgesOf(b)) {
-                      BasicBlock x = e._dst;
-                      if (x != blockToIgnore)
-                          pushBBOnStack(stack, bbSet, x);
-                  }
-               }
+                }
+                assert !stack.empty();
             }
         }
 
@@ -967,7 +1081,7 @@ public class CFG {
                 // If curr ends in a jump to next, remove the jump!
                 if (li instanceof JumpInstr) {
                     if (next == _bbMap.get(((JumpInstr)li).target)) {
-                        System.out.println("BB " + curr.getID() + " falls through in layout to BB " + next.getID() + ".  Removing jump from former bb!"); 
+//                        System.out.println("BB " + curr.getID() + " falls through in layout to BB " + next.getID() + ".  Removing jump from former bb!"); 
                         curr.removeInstr(li);
                     }
                 }
@@ -977,7 +1091,7 @@ public class CFG {
                     if (succs.size() == 1) {
                         BasicBlock tgt = succs.iterator().next()._dst;
                         if ((tgt != next) && ((li == null) || !li.operation.xfersControl())) {
-                            System.out.println("BB " + curr.getID() + " doesn't fall through to " + next.getID() + ".  Adding a jump to " + tgt._label);
+//                            System.out.println("BB " + curr.getID() + " doesn't fall through to " + next.getID() + ".  Adding a jump to " + tgt._label);
                             curr.addInstr(new JumpInstr(tgt._label));
                         }
                     }
@@ -985,7 +1099,7 @@ public class CFG {
 
                 if (curr == _exitBB) {
                     // Add a dummy ret
-                    System.out.println("Exit bb is not the last bb in the layout!  Adding a dummy return!");
+//                    System.out.println("Exit bb is not the last bb in the layout!  Adding a dummy return!");
                     curr.addInstr(new ReturnInstr(Nil.NIL));
                 }
             }
@@ -994,12 +1108,85 @@ public class CFG {
                 assert succs.size() == 1;
                 BasicBlock tgt = succs.iterator().next()._dst;
                 if ((li == null) || !li.operation.xfersControl()) {
-                    System.out.println("BB " + curr.getID() + " is the last bb in the layout! Adding a jump to " + tgt._label);
+//                    System.out.println("BB " + curr.getID() + " is the last bb in the layout! Adding a jump to " + tgt._label);
                     curr.addInstr(new JumpInstr(tgt._label));
                 }
             }
         }
 
         return _linearizedBBList;
+    }
+
+    public String toString() {
+        return "CFG[" + _scope.getScopeName() + ":" + _scope.getName() + "]";
+    }
+
+    public void setUpUseDefLocalVarMaps() {
+        _definedLocalVars = new java.util.HashSet<Variable>();
+        _usedLocalVars = new java.util.HashSet<Variable>();
+        for (BasicBlock bb: getNodes()) {
+            for (Instr i: bb.getInstrs()) {
+                for (Variable v : i.getUsedVariables()) {
+                    if (v instanceof LocalVariable)
+                        _usedLocalVars.add(v);
+                }
+                Variable v = i.getResult();
+                if ((v != null) && (v instanceof LocalVariable)) _definedLocalVars.add(v);
+            }
+        }
+
+        for (IRClosure cl: getScope().getClosures()) {
+            cl.getCFG().setUpUseDefLocalVarMaps();
+        }
+    }
+
+    public Set<Variable> usedLocalVarsFromClosures() {
+        HashSet vs = new HashSet();
+        for (IRClosure cl: getScope().getClosures()) {
+            CFG c = cl.getCFG();
+            vs.addAll(c._usedLocalVars);
+            vs.addAll(c.usedLocalVarsFromClosures());
+        }
+
+        return vs;
+    }
+
+    public Set<Variable> definedLocalVarsFromClosures() {
+        HashSet vs = new HashSet();
+        for (IRClosure cl: getScope().getClosures()) {
+            CFG c = cl.getCFG();
+            vs.addAll(c._definedLocalVars);
+            vs.addAll(c.definedLocalVarsFromClosures());
+        }
+
+        return vs;
+    }
+
+    public boolean usesLocalVariable(Variable v) {
+        if (_usedLocalVars.contains(v)) {
+            return true;
+        }
+        else {
+            for (IRClosure cl: getScope().getClosures()) {
+                if (cl.getCFG().usesLocalVariable(v))
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
+    public boolean definesLocalVariable(Variable v) {
+        if (_definedLocalVars.contains(v)) {
+            return true;
+        }
+        else {
+            for (IRClosure cl: getScope().getClosures()) {
+                if (cl.getCFG().definesLocalVariable(v))
+                    return true;
+            }
+
+            return false;
+        }
     }
 }

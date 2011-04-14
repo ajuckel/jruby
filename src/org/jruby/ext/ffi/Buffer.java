@@ -13,6 +13,7 @@ import org.jruby.anno.JRubyMethod;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
+import static org.jruby.runtime.Visibility.*;
 
 
 @JRubyClass(name = "FFI::Buffer", parent = "FFI::" + AbstractMemory.ABSTRACT_MEMORY_RUBY_CLASS)
@@ -74,14 +75,14 @@ public final class Buffer extends AbstractMemory {
     
     private static Buffer allocate(ThreadContext context, IRubyObject recv, 
             IRubyObject sizeArg, int count, int flags) {
-        final int typeSize = calculateSize(context, sizeArg);
+        final int typeSize = calculateTypeSize(context, sizeArg);
         final int total = typeSize * count;
         return new Buffer(context.getRuntime(), recv, 
                 new ArrayMemoryIO(context.getRuntime(), total), total, typeSize, flags);
     }
 
-    private IRubyObject init(ThreadContext context, IRubyObject sizeArg, int count, int flags) {
-        this.typeSize = calculateSize(context, sizeArg);
+    private IRubyObject init(ThreadContext context, IRubyObject rbTypeSize, int count, int flags) {
+        this.typeSize = calculateTypeSize(context, rbTypeSize);
         this.size = this.typeSize * count;
         this.inout = flags;
         setMemoryIO(new ArrayMemoryIO(context.getRuntime(), (int) this.size));
@@ -91,7 +92,10 @@ public final class Buffer extends AbstractMemory {
 
     @JRubyMethod
     public IRubyObject initialize(ThreadContext context, IRubyObject sizeArg) {
-        return init(context, sizeArg, 1, IN | OUT);
+        return sizeArg instanceof RubyFixnum
+                ? init(context, RubyFixnum.one(context.getRuntime()), 
+                    RubyFixnum.fix2int(sizeArg), IN | OUT)
+                : init(context, sizeArg, 1, IN | OUT);
     }
 
     @JRubyMethod
@@ -103,6 +107,23 @@ public final class Buffer extends AbstractMemory {
     public IRubyObject initialize(ThreadContext context, IRubyObject sizeArg,
             IRubyObject countArg, IRubyObject clearArg) {
         return init(context, sizeArg, RubyFixnum.fix2int(countArg), IN | OUT);
+    }
+    
+    /**
+     * 
+     */
+    @JRubyMethod(required = 1, visibility=PRIVATE)
+    public IRubyObject initialize_copy(ThreadContext context, IRubyObject other) {
+        if (this == other) {
+            return this;
+        }
+        Buffer orig = (Buffer) other;
+        this.typeSize = orig.typeSize;
+        this.size = orig.size;
+        this.inout = orig.inout;
+        
+        setMemoryIO(orig.getMemoryIO().dup());
+        return this;
     }
 
     @JRubyMethod(name = { "alloc_inout", "__alloc_inout" }, meta = true)

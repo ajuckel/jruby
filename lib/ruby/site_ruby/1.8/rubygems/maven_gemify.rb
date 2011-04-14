@@ -1,36 +1,86 @@
-if defined?(JRUBY_VERSION)
-  
-  class Gem::Specification
-    # return whether the spec name represents a maven artifact
-    def self.maven_name?(name)
-      case name
-      when Regexp
-        name.source =~ /\./
-      else
-        name =~ /\./
-      end
+require 'uri'
+require 'rubygems/spec_fetcher'
+require 'rubygems/remote_fetcher'
+
+module Gem
+  module MavenUtils
+    def maven_name?(name)
+      name = name.source.sub(/\^/, '') if Regexp === name
+      name =~ /^mvn:/
+    end
+
+    def maven_source_uri?(source_uri)
+      source_uri.scheme == "mvn" || source_uri.host == "maven"
+    end
+
+    def maven_sources
+      Gem.sources.select {|x| x =~ /^mvn:/}
+    end
+
+    def maven_spec?(gemname, source_uri)
+      maven_name?(gemname) && maven_source_uri?(source_uri)
     end
   end
-  
-  class Gem::RemoteFetcher
+
+  class Maven3NotFound < StandardError; end
+
+  class RemoteFetcher
+    include MavenUtils
+
     def download_maven(spec, local_gem_path)
-      require 'rubygems/maven_gemify'
-      FileUtils.cp Gem::Maven::Gemify.generate_gem(spec.name, spec.version), local_gem_path
+      FileUtils.cp Gem::Maven::Gemify.new(maven_sources).generate_gem(spec.name, spec.version), local_gem_path
       local_gem_path
     end
     private :download_maven
   end
-  
-  class Gem::SpecFetcher
-    def gemify_generate_spec(spec)
-      require 'rubygems/maven_gemify'
-      specfile = Gem::Maven::Gemify.generate_spec(spec[0], spec[1])
+
+  class SpecFetcher
+    include MavenUtils
+
+    alias orig_find_matching_with_errors find_matching_with_errors
+    def find_matching_with_errors(dependency, all = false, matching_platform = true, prerelease = false)
+      if maven_name? dependency.name
+        begin
+          result = maven_find_matching_with_errors(dependency)
+        rescue Gem::Maven3NotFound => e
+          raise e
+        rescue => e
+          warn "maven find dependency failed for #{dependency}: #{e.to_s}" if Gem::Maven::Gemify.verbose?
+        end
+      end
+      if result && !result.flatten.empty?
+        result
+      else
+        orig_find_matching_with_errors(dependency, all, matching_platform, prerelease)
+      end
+    end
+
+    alias orig_list list
+    def list(*args)
+      sources = Gem.sources
+      begin
+        Gem.sources -= maven_sources
+        return orig_list(*args)
+      ensure
+        Gem.sources = sources
+      end
+    end
+
+    alias orig_load_specs load_specs
+    def load_specs(source_uri, file)
+      return if source_uri.scheme == "mvn"
+      orig_load_specs(source_uri, file)
+    end
+
+    private
+    def maven_generate_spec(spec)
+      specfile = Gem::Maven::Gemify.new(maven_sources).generate_spec(spec[0], spec[1])
+      return nil unless specfile
       Marshal.dump(Gem::Specification.from_yaml(File.read(specfile)))
     end
-    private :gemify_generate_spec
-  
+
     # use maven to locate (generate) the specification for the dependency in question
-    def find_matching_using_maven(dependency)
+    def maven_find_matching_with_errors(dependency)
       specs_and_sources = []
       if dependency.name.is_a? Regexp
         dep_name = dependency.name.source.sub(/\^/, '')
@@ -38,8 +88,7 @@ if defined?(JRUBY_VERSION)
         dep_name = dependency.name
       end
 
-      require 'rubygems/maven_gemify'
-      Gem::Maven::Gemify.get_versions(dep_name).each do |version|
+      Gem::Maven::Gemify.new(maven_sources).get_versions(dep_name).each do |version|
         # maven-versions which start with an letter get "0.0.0." prepended to
         # satisfy gem-version requirements
         if dependency.requirement.satisfied_by? Gem::Version.new "#{version.sub(/^0.0.0./, '1.')}"
@@ -49,15 +98,66 @@ if defined?(JRUBY_VERSION)
 
       [specs_and_sources, []]
     end
-    private :find_matching_using_maven
   end
-  
-  module Gem::Maven
+
+  module Maven
     class Gemify
-      BASE_GOAL = "de.saumya.mojo:gemify-maven-plugin:0.22.0"
-      
+      DEFAULT_PLUGIN_VERSION = "0.26.0"
+
+      attr_reader :repositories
+
+      def initialize(*repositories)
+        maven                   # ensure maven initialized
+        @repositories = repositories.length > 0 ? [repositories].flatten : []
+        @repositories.map! do |r|
+          u = URI === r ? r : URI.parse(r)
+          if u.scheme == "mvn"
+            if u.opaque == "central"
+              u = nil
+            else
+              u.scheme = "http"
+            end
+          end
+          u
+        end
+      end
+
+      @@verbose = false
+      def self.verbose?
+        @@verbose || $DEBUG
+      end
+      def verbose?
+        self.class.verbose?
+      end
+      def self.verbose=(v)
+        @@verbose = v
+      end
+
       private
-      
+      def self.maven_config
+        @maven_config ||= Gem.configuration["maven"] || {}
+      end
+      def maven_config; self.class.maven_config; end
+
+      def self.base_goal
+        @base_goal ||= "de.saumya.mojo:gemify-maven-plugin:#{maven_config['plugin_version'] || DEFAULT_PLUGIN_VERSION}"
+      end
+      def base_goal; self.class.base_goal; end
+
+      def self.java_imports
+        %w(
+           org.codehaus.plexus.classworlds.ClassWorld
+           org.codehaus.plexus.DefaultContainerConfiguration
+           org.codehaus.plexus.DefaultPlexusContainer
+           org.apache.maven.Maven
+           org.apache.maven.repository.RepositorySystem
+           org.apache.maven.execution.DefaultMavenExecutionRequest
+           org.apache.maven.artifact.repository.MavenArtifactRepository
+           org.apache.maven.artifact.repository.layout.DefaultRepositoryLayout
+           org.apache.maven.artifact.repository.ArtifactRepositoryPolicy
+          ).each {|i| java_import i }
+      end
+
       def self.create_maven
         require 'java' # done lazily, so we're not loading it all the time
         bin = nil
@@ -97,105 +197,150 @@ if defined?(JRUBY_VERSION)
         else
           bin = nil
         end
-        raise "can not find maven3 installation. install ruby-maven with\n\n\tjruby -S gem install ruby-maven --pre\n\n" if bin.nil?
-        warn "Using Maven install at #{bin}"
+        raise Gem::Maven3NotFound.new("can not find maven3 installation. install ruby-maven with\n\n\tjruby -S gem install ruby-maven\n\n") if bin.nil?
+
+        warn "Using Maven install at #{bin}" if verbose?
+
         boot = File.join(bin, "..", "boot")
         lib = File.join(bin, "..", "lib")
         ext = File.join(bin, "..", "ext")
-        classpath = (Dir.glob(lib + "/*jar")  + Dir.glob(boot + "/*jar"))
-        
+        (Dir.glob(lib + "/*jar")  + Dir.glob(boot + "/*jar")).each {|path| require path }
+
         java.lang.System.setProperty("classworlds.conf", File.join(bin, "m2.conf"))
-        
         java.lang.System.setProperty("maven.home", File.join(bin, ".."))
-        classpath.each do |path|
-          require path
-        end
-        
-        import "org.codehaus.plexus.classworlds"
-        java_import "org.codehaus.plexus.DefaultContainerConfiguration"
-        java_import "org.codehaus.plexus.DefaultPlexusContainer"
-        java_import "org.apache.maven.Maven"
-        java_import "org.apache.maven.execution.DefaultMavenExecutionRequest"
+        java_imports
 
         class_world = ClassWorld.new("plexus.core", java.lang.Thread.currentThread().getContextClassLoader());
         config = DefaultContainerConfiguration.new
         config.set_class_world class_world
         config.set_name "ruby-tools"
         container = DefaultPlexusContainer.new(config);
+        @@execution_request_populator = container.lookup(org.apache.maven.execution.MavenExecutionRequestPopulator.java_class)
+
+        @@settings_builder = container.lookup(org.apache.maven.settings.building.SettingsBuilder.java_class )
         container.lookup(Maven.java_class)
       end
-      
-      def self.maven_get
+
+      def self.maven
         @maven ||= create_maven
       end
-      
+      def maven; self.class.maven; end
+
       def self.temp_dir
         @temp_dir ||=
-        begin
-          f = java.io.File.createTempFile("gemify", "")
-          f.delete
-          f.mkdir
-          f.deleteOnExit
-          f.absolute_path
-        end
+          begin
+            f = java.io.File.createTempFile("gemify", "")
+            f.delete
+            f.mkdir
+            f.deleteOnExit
+            f.absolute_path
+          end
       end
-      
-      def self.execute(goal, gemname, version, props = {})
-        maven = maven_get
-        r = DefaultMavenExecutionRequest.new
-        r.set_show_errors false
-        r.user_properties.put("gemify.skipDependencies", "true")
-        r.user_properties.put("gemify.tempDir", temp_dir)
-        r.user_properties.put("gemify.gemname", gemname)
-        r.user_properties.put("gemify.version", version.to_s) if version
-        props.each do |k,v|
-          r.user_properties.put(k.to_s, v.to_s)
+      def temp_dir; self.class.temp_dir; end
+
+      def execute(goal, gemname, version, props = {})
+        request = DefaultMavenExecutionRequest.new
+        request.set_show_errors Gem.configuration.backtrace
+        skip_dependencies = (!maven_config["dependencies"]).to_s
+        request.user_properties.put("gemify.skipDependencies", skip_dependencies)
+        request.user_properties.put("gemify.tempDir", temp_dir)
+        request.user_properties.put("gemify.gemname", gemname)
+        request.user_properties.put("gemify.version", version.to_s) if version
+
+        if maven_config["repositories"]
+          maven_config["repositories"].each { |r| @repositories << r }
         end
-        r.set_goals [goal]
-        r.set_logging_level 0
-        
+        if @repositories.size > 0
+          request.user_properties.put("gemify.repositories", @repositories.join(","))
+        end
+
+        props.each do |k,v|
+          request.user_properties.put(k.to_s, v.to_s)
+        end
+        request.set_goals [goal]
+        request.set_logging_level 0
+
+        settings = setup_settings(maven_config["settings"], request.user_properties)
+        @@execution_request_populator.populateFromSettings(request, settings)
+        @@execution_request_populator.populateDefaults(request)
+
+        if profiles = maven_config["profiles"]
+          profiles.each { |profile| request.addActiveProfile(profile) }
+        end
+        if verbose?
+          active_profiles = request.getActiveProfiles.collect{ |p| p.to_s }
+          puts "active profiles:\n\t[#{active_profiles.join(', ')}]"
+          puts "maven goals:"
+          request.goals.each { |g| puts "\t#{g}" }
+          puts "system properties:"
+          request.getUserProperties.map.each { |k,v| puts "\t#{k} => #{v}" }
+          puts
+        end
         out = java.lang.System.out
         string_io = java.io.ByteArrayOutputStream.new
         java.lang.System.setOut(java.io.PrintStream.new(string_io))
-        result = maven.execute( r );
+        result = maven.execute request
         java.lang.System.out = out
-        if r.is_show_errors
-          puts "maven goals:"
-          r.goals.each { |g| puts "\t#{g}" }
-          puts "system properties:"
-          r.getUserProperties.map.each { |k,v| puts "\t#{k} => #{v}" }
 
-          result.exceptions.each do |e|
-            e.print_stack_trace
-            string_io.write(e.get_message.to_java_string.get_bytes)
-          end
+        result.exceptions.each do |e|
+          e.print_stack_trace if request.is_show_errors
+          string_io.write(e.get_message.to_java_string.get_bytes)
         end
         string_io.to_s
       end
-      
-      public
-      
-      def self.get_versions(gemname)
-        verbose = false #true
-        gemname = gemname.source.sub(/\^/, '') if gemname.is_a? Regexp
 
-        result = execute("#{BASE_GOAL}:versions", gemname, nil)
-        
-        if result =~ /\[/ && result =~ /\]/
-          result = result.gsub(/\n/, '').sub(/.*\[/, "").sub(/\]/, '').gsub(/ /, '').split(',')
-          puts "versions: #{result.inspect}" if verbose
+      def setup_settings(user_settings_file, user_props)
+        @settings ||=
+          begin
+            user_settings_file =
+              if user_settings_file
+                resolve_file(usr_settings_file)
+              else
+                user_maven_home = java.io.File.new(java.lang.System.getProperty("user.home"), ".m2")
+                java.io.File.new(user_maven_home, "settings.xml")
+              end
+
+            global_settings_file =java.io.File.new(@conf, "settings.xml")
+
+            settings_request = org.apache.maven.settings.building.DefaultSettingsBuildingRequest.new
+            settings_request.setGlobalSettingsFile(global_settings_file)
+            settings_request.setUserSettingsFile(user_settings_file)
+            settings_request.setSystemProperties(java.lang.System.getProperties)
+            settings_request.setUserProperties(user_props)
+
+            settings_result = @@settings_builder.build(settings_request)
+            settings_result.effective_settings
+          end
+      end
+
+      def resolve_file(file)
+        return nil if file.nil?
+        return file if file.isAbsolute
+        if file.getPath.startsWith(java.io.File.separator)
+          # drive-relative Windows path
+          return file.getAbsoluteFile
+        else
+          return java.io.File.new( java.lang.System.getProperty("user.dir"), file.getPath ).getAbsoluteFile
+        end
+      end
+
+      public
+      def get_versions(gemname)
+        name = maven_name(gemname)
+        result = execute("#{base_goal}:versions", name, nil)
+
+        if result =~ /#{name} \[/
+          result = result.gsub(/\r?\n/, '').sub(/.*\[/, "").sub(/\]/, '').gsub(/ /, '').split(',')
+          puts "versions: #{result.inspect}" if verbose?
           result
         else
           []
         end
       end
-      
-      def self.generate_spec(gemname, version)        
-        #     puts "generate spec"
-        #     p gemname
-        #     p version
-        result = execute("#{BASE_GOAL}:gemify", gemname, version, {"gemify.onlySpecs" => true })
-        path = result.gsub(/\n/, '')
+
+      def generate_spec(gemname, version)
+        result = execute("#{base_goal}:gemify", maven_name(gemname), version, "gemify.onlySpecs" => true)
+        path = result.gsub(/\r?\n/, '')
         if path =~ /gemspec: /
           path = path.sub(/.*gemspec: /, '')
           if path.size > 0
@@ -205,14 +350,10 @@ if defined?(JRUBY_VERSION)
           end
         end
       end
-      
-      def self.generate_gem(gemname, version)
-        #    p "generate gem"
-        #    p gemname
-        #    p version.to_s
-        
-        result = execute("#{BASE_GOAL}:gemify", gemname, version)
-        path = result.gsub(/\n/, '')
+
+      def generate_gem(gemname, version)
+        result = execute("#{base_goal}:gemify", maven_name(gemname), version)
+        path = result.gsub(/\r?\n/, '')
         if path =~ /gem: /
 
           path = path.sub(/.*gem: /, '')
@@ -222,9 +363,14 @@ if defined?(JRUBY_VERSION)
             result
           end
         else
-          warn result.sub(/.*Missing Artifacts:\s+/, '').gsub(/\tmvn/, "\t#{@mvn}")
+          warn result.sub(/Failed.*pom:/, '').gsub(/\tmvn/, "\t#{@mvn}")
           raise "error gemify #{gemname}:#{version}"
         end
+      end
+
+      def maven_name(gemname)
+        gemname = gemname.source if Regexp === gemname
+        gemname
       end
     end
   end

@@ -41,40 +41,50 @@ import org.jruby.lexer.yacc.ISourcePosition;
 import org.jruby.runtime.Block;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.util.ByteList;
+import org.jruby.util.RegexpOptions;
 
 /**
  * A regexp which contains some expressions which will need to be evaluated everytime the regexp 
  * is used for a match.
  */
-public class DRegexpNode extends ListNode implements ILiteralNode {
-    private final int options;
-    private final boolean once;
+public class DRegexpNode extends DNode implements ILiteralNode {
+    private final RegexpOptions options;
     private RubyRegexp onceRegexp;
-    
-    public DRegexpNode(ISourcePosition position) {
-        this(position, 0, false);
+    private boolean is19;
+
+    // 1.8 constructor
+    public DRegexpNode(ISourcePosition position, RegexpOptions options) {
+        this(position, options, false);
     }
 
-    public DRegexpNode(ISourcePosition position, DStrNode node, int options, boolean once) {
-        this(position, options, once);
-        addAll(node);
-    }
-
-    public DRegexpNode(ISourcePosition position, int options, boolean once) {
-        super(position);
-
+    // 1.9 constructor
+    public DRegexpNode(ISourcePosition position, RegexpOptions options, boolean is19) {
+        super(position, null);
         this.options = options;
-        this.once = once;
+        this.is19 = is19;
     }
 
+    @Override
     public NodeType getNodeType() {
         return NodeType.DREGEXPNODE;
+    }
+
+    @Override
+    protected RubyString allocateString(Ruby runtime) {
+        return runtime.newString(new ByteList());
+    }
+
+    @Override
+    public boolean is19() {
+        return is19;
     }
 
     /**
      * Accept for the visitor pattern.
      * @param iVisitor the visitor
      **/
+    @Override
     public Object accept(NodeVisitor iVisitor) {
         return iVisitor.visitDRegxNode(this);
     }
@@ -84,54 +94,26 @@ public class DRegexpNode extends ListNode implements ILiteralNode {
      * @return Returns a boolean
      */
     public boolean getOnce() {
-        return once;
+        return options.isOnce();
     }
 
     /**
      * Gets the options.
      * @return Returns a int
      */
-    public int getOptions() {
+    public RegexpOptions getOptions() {
         return options;
-    }
-
-    /**
-     * For regular expressions with /o flag
-     * @return
-     */
-    public RubyRegexp getOnceRegexp() {
-        return onceRegexp;
-    }
-    
-    /**
-     * For regular expressions with /o flag, the value in here can be used for subsequent evaluations.
-     * Setting will only succeed if it is a regular expression with /o flag, and the value hasn't been already set.
-     * @param regexp
-     */
-    public void setOnceRegexp(RubyRegexp regexp) {
-        if (once && onceRegexp == null) this.onceRegexp = regexp;
     }
     
     @Override
     public IRubyObject interpret(Ruby runtime, ThreadContext context, IRubyObject self, Block aBlock) {
-        if (once && onceRegexp != null) return onceRegexp;
+        if (getOnce() && onceRegexp != null) return onceRegexp;
 
-        RubyString string = DStrNode.buildDynamicString(runtime, context, self, aBlock, this);
-
+        RubyString string = (RubyString) super.interpret(runtime, context, self, aBlock);
         RubyRegexp regexp = RubyRegexp.newDRegexp(runtime, string, options);
         
-        if (once) setOnceRegexp(regexp);
+        if (getOnce() && onceRegexp == null) onceRegexp = regexp;
 
         return regexp;
-    }
-
-    @Override
-    public String definition(Ruby runtime, ThreadContext context, IRubyObject self, Block aBlock) {
-        String definition = super.definition(runtime, context, self, aBlock);
-        if (definition == null && context.getRuntime().is1_9()) {
-            definition = "expression";
-        }
-
-        return definition;
     }
 }

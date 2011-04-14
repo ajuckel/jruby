@@ -29,21 +29,30 @@
 
 package org.jruby.compiler;
 
+import org.joni.ast.BackRefNode;
 import org.jruby.RubyInstanceConfig;
+import org.jruby.RubyMatchData;
 import org.jruby.ast.ArgsNode;
 import org.jruby.ast.ArgsPushNode;
+import org.jruby.ast.ArgumentNode;
 import org.jruby.ast.ArrayNode;
+import org.jruby.ast.EncodingNode;
+import org.jruby.ast.FCallNode;
 import org.jruby.ast.IterNode;
 import org.jruby.ast.HashNode;
 import org.jruby.ast.Hash19Node;
 import org.jruby.ast.Node;
 import org.jruby.ast.LambdaNode;
 import org.jruby.ast.ListNode;
+import org.jruby.ast.Match2CaptureNode;
 import org.jruby.ast.MultipleAsgn19Node;
 import org.jruby.ast.MultipleAsgnNode;
 import org.jruby.ast.NodeType;
+import org.jruby.ast.NthRefNode;
 import org.jruby.ast.OptArgNode;
+import org.jruby.ast.SValue19Node;
 import org.jruby.ast.StarNode;
+import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.Arity;
 import org.jruby.runtime.BlockBody;
 
@@ -55,10 +64,13 @@ public class ASTCompiler19 extends ASTCompiler {
     @Override
     public void compile(Node node, BodyCompiler context, boolean expr) {
         if (node == null) {
-            context.loadNil();
+            if (expr) context.loadNil();
             return;
         }
         switch (node.getNodeType()) {
+        case ENCODINGNODE:
+            compileEncoding(node, context, expr);
+            break;
         case LAMBDANODE:
             compileLambda(node, context, expr);
             break;
@@ -82,6 +94,62 @@ public class ASTCompiler19 extends ASTCompiler {
         compileMethodArgs(node, context, expr);
     }
 
+    @Override
+    public void compileAssignment(Node node, BodyCompiler context, boolean expr) {
+        switch (node.getNodeType()) {
+            case MULTIPLEASGN19NODE:
+                compileMultipleAsgn19Assignment(node, context, expr);
+                break;
+            default:
+                super.compileAssignment(node, context, expr);
+        }
+    }
+
+    @Override
+    protected void compileDefinedAndOrDStrDRegexp(final Node node, BodyCompiler context) {
+        context.pushString("expression");
+    }
+
+    @Override
+    protected void compileDefinedBackref(final Node node, BodyCompiler context) {
+        context.backref();
+        context.isInstanceOf(RubyMatchData.class,
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushString("global-variable");
+                    }
+                },
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushNull();
+                    }
+                });
+    }
+
+    @Override
+    protected void compileDefinedDVar(final Node node, BodyCompiler context) {
+        context.pushString("local-variable");
+    }
+
+    @Override
+    protected void compileDefinedNthref(final Node node, BodyCompiler context) {
+        context.isCaptured(((NthRefNode) node).getMatchNumber(),
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushString("global-variable");
+                    }
+                },
+                new BranchCallback() {
+
+                    public void branch(BodyCompiler context) {
+                        context.pushNull();
+                    }
+                });
+    }
+
     public void compileMethodArgs(Node node, BodyCompiler context, boolean expr) {
         final ArgsNode argsNode = (ArgsNode) node;
 
@@ -98,8 +166,19 @@ public class ASTCompiler19 extends ASTCompiler {
         if (required > 0) {
             requiredAssignment = new ArrayCallback() {
                 public void nextValue(BodyCompiler context, Object object, int index) {
-                    // FIXME: Somehow I'd feel better if this could get the appropriate var index from the ArgumentNode
-                    context.getVariableCompiler().assignLocalVariable(index, false);
+                    ArrayNode arguments = (ArrayNode)object;
+                    Node argNode = arguments.get(index);
+                    switch (argNode.getNodeType()) {
+                    case ARGUMENTNODE:
+                        int varIndex = ((ArgumentNode)argNode).getIndex();
+                        context.getVariableCompiler().assignLocalVariable(varIndex, false);
+                        break;
+                    case MULTIPLEASGN19NODE:
+                        compileMultipleAsgn19Assignment(argNode, context, false);
+                        break;
+                    default:
+                        throw new NotCompilableException("unknown argument type: " + argNode);
+                    }
                 }
             };
         }
@@ -160,9 +239,17 @@ public class ASTCompiler19 extends ASTCompiler {
 
         compile(argsPush.getFirstNode(), context,true);
         compile(argsPush.getSecondNode(), context,true);
-        context.appendToArray();
+        context.argsPush();
         // TODO: don't require pop
         if (!expr) context.consumeCurrentValue();
+    }
+
+    public void compileEncoding(Node node, BodyCompiler context, boolean expr) {
+        final EncodingNode encodingNode = (EncodingNode)node;
+
+        if (expr) {
+            context.loadEncoding(encodingNode.getEncoding());
+        }
     }
 
     @Override
@@ -217,28 +304,23 @@ public class ASTCompiler19 extends ASTCompiler {
         if (argsNodeId == null) {
             // no args, do not pass args processor
             context.createNewClosure19(iterNode.getPosition().getFile(), iterNode.getPosition().getStartLine(), iterNode.getScope(), Arity.procArityOf(iterNode.getVarNode()).getValue(),
-                    closureBody, null, hasMultipleArgsHead, argsNodeId, inspector);
+                    closureBody, null, hasMultipleArgsHead, argsNodeId, RuntimeHelpers.encodeParameterList(argsNode), inspector);
         } else {
             context.createNewClosure19(iterNode.getPosition().getFile(), iterNode.getPosition().getStartLine(), iterNode.getScope(), Arity.procArityOf(iterNode.getVarNode()).getValue(),
-                    closureBody, closureArgs, hasMultipleArgsHead, argsNodeId, inspector);
+                    closureBody, closureArgs, hasMultipleArgsHead, argsNodeId, RuntimeHelpers.encodeParameterList(argsNode), inspector);
         }
     }
 
     public void compileLambda(Node node, BodyCompiler context, boolean expr) {
         final LambdaNode lambdaNode = (LambdaNode)node;
 
-        boolean doit = expr || !RubyInstanceConfig.PEEPHOLE_OPTZ;
-        boolean popit = !RubyInstanceConfig.PEEPHOLE_OPTZ && !expr;
-
-        if (doit) {
+        if (expr) {
             context.createNewLambda(new CompilerCallback() {
                 public void call(BodyCompiler context) {
                     compileIter(lambdaNode, context);
                 }
             });
         }
-
-        if (popit) context.consumeCurrentValue();
     }
 
     public void compileMultipleAsgn19(Node node, BodyCompiler context, boolean expr) {
@@ -302,7 +384,7 @@ public class ASTCompiler19 extends ASTCompiler {
         final MultipleAsgn19Node multipleAsgn19Node = (MultipleAsgn19Node) node;
 
         // normal items at the front or back of the masgn
-        ArrayCallback preAssignCallback = new ArrayCallback() {
+        ArrayCallback prePostAssignCallback = new ArrayCallback() {
 
                     public void nextValue(BodyCompiler context, Object sourceArray,
                             int index) {
@@ -344,9 +426,9 @@ public class ASTCompiler19 extends ASTCompiler {
             context.ensureMultipleAssignableRubyArray(multipleAsgn19Node.getPreCount() != 0 || multipleAsgn19Node.getPostCount() != 0);
 
             if (multipleAsgn19Node.getRest() == null) {
-                context.forEachInValueArray(0, multipleAsgn19Node.getPreCount(), multipleAsgn19Node.getPre(), multipleAsgn19Node.getPostCount(), multipleAsgn19Node.getPost(), preAssignCallback, null);
+                context.forEachInValueArray(0, multipleAsgn19Node.getPreCount(), multipleAsgn19Node.getPre(), multipleAsgn19Node.getPostCount(), multipleAsgn19Node.getPost(), prePostAssignCallback, null);
             } else {
-                context.forEachInValueArray(0, multipleAsgn19Node.getPreCount(), multipleAsgn19Node.getPre(), multipleAsgn19Node.getPostCount(), multipleAsgn19Node.getPost(), preAssignCallback, restCallback);
+                context.forEachInValueArray(0, multipleAsgn19Node.getPreCount(), multipleAsgn19Node.getPre(), multipleAsgn19Node.getPostCount(), multipleAsgn19Node.getPost(), prePostAssignCallback, restCallback);
             }
         }
         // TODO: don't require pop
@@ -361,6 +443,38 @@ public class ASTCompiler19 extends ASTCompiler {
     @Override
     protected void createNewHash(BodyCompiler context, HashNode hashNode, ArrayCallback hashCallback) {
         context.createNewHash19(hashNode.getListNode(), hashCallback, hashNode.getListNode().size() / 2);
+    }
+
+    public void compileMatch2(Node node, BodyCompiler context, boolean expr) {
+        if (!(node instanceof Match2CaptureNode)) {
+            super.compileMatch2(node, context, expr);
+            return;
+        }
+
+        // match with capture logic
+        final Match2CaptureNode matchNode = (Match2CaptureNode) node;
+
+        compile(matchNode.getReceiverNode(), context,true);
+        CompilerCallback value = new CompilerCallback() {
+            public void call(BodyCompiler context) {
+                compile(matchNode.getValueNode(), context,true);
+            }
+        };
+
+        context.match2Capture(value, matchNode.getScopeOffsets());
+        // TODO: don't require pop
+        if (!expr) context.consumeCurrentValue();
+    }
+
+    @Override
+    public void compileSValue(Node node, BodyCompiler context, boolean expr) {
+        SValue19Node svalueNode = (SValue19Node)node;
+
+        compile(svalueNode.getValue(), context,true);
+
+        context.singlifySplattedValue19();
+        // TODO: don't require pop
+        if (!expr) context.consumeCurrentValue();
     }
 
     @Override

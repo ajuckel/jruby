@@ -1,5 +1,6 @@
 package org.jruby.compiler.ir.instructions;
 
+import org.jruby.RubyModule;
 import org.jruby.compiler.ir.Operation;
 import org.jruby.compiler.ir.operands.Label;
 import org.jruby.compiler.ir.operands.Operand;
@@ -13,12 +14,12 @@ import org.jruby.runtime.builtin.IRubyObject;
 // Rather than building a zillion instructions that capture calls to ruby implementation internals,
 // we are building one that will serve as a placeholder for internals-specific call optimizations.
 public class RubyInternalCallInstr extends CallInstr {
-    public RubyInternalCallInstr(Variable result, Operand methAddr, Operand receiver,
+    public RubyInternalCallInstr(Variable result, MethAddr methAddr, Operand receiver,
             Operand[] args) {
         super(Operation.RUBY_INTERNALS, result, methAddr, receiver, args, null);
     }
 
-    public RubyInternalCallInstr(Variable result, Operand methAddr, Operand receiver,
+    public RubyInternalCallInstr(Variable result, MethAddr methAddr, Operand receiver,
             Operand[] args, Operand closure) {
         super(result, methAddr, receiver, args, closure);
     }
@@ -42,8 +43,8 @@ public class RubyInternalCallInstr extends CallInstr {
     @Override
     public Instr cloneForInlining(InlinerInfo ii) {
         return new RubyInternalCallInstr(ii.getRenamedVariable(result),
-                _methAddr.cloneForInlining(ii), getReceiver().cloneForInlining(ii),
-                cloneCallArgs(ii), _closure == null ? null : _closure.cloneForInlining(ii));
+                (MethAddr) methAddr.cloneForInlining(ii), getReceiver().cloneForInlining(ii),
+                cloneCallArgs(ii), closure == null ? null : closure.cloneForInlining(ii));
     }
 
     @Override
@@ -51,8 +52,8 @@ public class RubyInternalCallInstr extends CallInstr {
         if (getMethodAddr() == MethAddr.DEFINE_ALIAS) {
             Operand[] args = getCallArgs(); // Guaranteed 2 args by parser
 
-            self.getMetaClass().defineAlias((String) args[0].retrieve(interp).toString(),
-                    (String) args[1].retrieve(interp).toString());
+            RubyModule clazz = self instanceof RubyModule ? (RubyModule) self : self.getMetaClass();
+            clazz.defineAlias((String) args[0].retrieve(interp).toString(), (String) args[1].retrieve(interp).toString());
         } else {
             super.interpret(interp, self);
         }

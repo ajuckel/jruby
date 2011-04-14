@@ -4,9 +4,9 @@ package org.jruby.ext.ffi;
 
 import org.jruby.Ruby;
 import org.jruby.RubyClass;
+import org.jruby.RubyFixnum;
 import org.jruby.RubyModule;
 import org.jruby.RubyNumeric;
-import org.jruby.RubyString;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
 import org.jruby.exceptions.RaiseException;
@@ -45,8 +45,8 @@ public final class MemoryPointer extends Pointer {
         super(runtime, (RubyClass) klass, io, total, typeSize);
     }
 
-    private final IRubyObject init(ThreadContext context, IRubyObject sizeArg, int count, int align, boolean clear, Block block) {
-        typeSize = calculateSize(context, sizeArg);
+    private final IRubyObject init(ThreadContext context, IRubyObject rbTypeSize, int count, int align, boolean clear, Block block) {
+        typeSize = calculateTypeSize(context, rbTypeSize);
         size = typeSize * count;
         if (size < 0) {
             throw context.getRuntime().newArgumentError(String.format("Negative size (%d objects of %d size)", count, typeSize));
@@ -84,7 +84,10 @@ public final class MemoryPointer extends Pointer {
 
     @JRubyMethod(name = { "initialize" })
     public final IRubyObject initialize(ThreadContext context, IRubyObject sizeArg, Block block) {
-        return init(context, sizeArg, 1, 1, true, block);
+        return sizeArg instanceof RubyFixnum
+                ? init(context, RubyFixnum.one(context.getRuntime()), 
+                    RubyFixnum.fix2int(sizeArg), 1, true, block)
+                : init(context, sizeArg, 1, 1, true, block);
     }
     
     @JRubyMethod(name = { "initialize" })
@@ -97,7 +100,7 @@ public final class MemoryPointer extends Pointer {
             IRubyObject sizeArg, IRubyObject count, IRubyObject clear, Block block) {
         return init(context, sizeArg, RubyNumeric.fix2int(count), 1, clear.isTrue(), block);
     }
-
+    
     @Override
     public final String toString() {
         return String.format("MemoryPointer[address=%#x, size=%d]", getAddress(), size);

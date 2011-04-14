@@ -28,20 +28,32 @@
  ***** END LICENSE BLOCK *****/
 package org.jruby.parser;
 
+import org.jcodings.Encoding;
+import org.jruby.RubyRegexp;
 import org.jruby.ast.AssignableNode;
 import org.jruby.ast.ClassVarAsgnNode;
 import org.jruby.ast.ConstDeclNode;
+import org.jruby.ast.DRegexpNode;
+import org.jruby.ast.DStrNode;
 import org.jruby.ast.GlobalAsgnNode;
 import org.jruby.ast.InstAsgnNode;
+import org.jruby.ast.Match2CaptureNode;
+import org.jruby.ast.Match2Node;
+import org.jruby.ast.Match3Node;
 import org.jruby.ast.Node;
+import org.jruby.ast.RegexpNode;
 import org.jruby.ast.SValue19Node;
 import org.jruby.ast.SValueNode;
 import org.jruby.ast.Splat19Node;
 import org.jruby.ast.SplatNode;
 import org.jruby.lexer.yacc.ISourcePosition;
+import org.jruby.lexer.yacc.RubyYaccLexer;
 import org.jruby.lexer.yacc.SyntaxException;
 import org.jruby.lexer.yacc.SyntaxException.PID;
 import org.jruby.lexer.yacc.Token;
+import org.jruby.util.ByteList;
+import org.jruby.util.RegexpOptions;
+import org.jruby.util.StringSupport;
 
 public class ParserSupport19 extends ParserSupport {
     @Override
@@ -92,6 +104,11 @@ public class ParserSupport19 extends ParserSupport {
     }
 
     @Override
+    public DStrNode createDStrNode(ISourcePosition position) {
+        return new DStrNode(position, lexer.getEncoding());
+    }
+
+    @Override
     protected void getterIdentifierError(ISourcePosition position, String identifier) {
         throw new SyntaxException(PID.BAD_IDENTIFIER, position, "identifier " +
                 identifier + " is not valid to get", identifier);
@@ -106,4 +123,96 @@ public class ParserSupport19 extends ParserSupport {
     public SValueNode newSValueNode(ISourcePosition position, Node node) {
         return new SValue19Node(position, node);
     }
+
+    private int[] allocateNamedLocals(RegexpNode regexpNode) {
+        String[] names = regexpNode.loadPattern(configuration.getRuntime()).getNames();
+        int length = names.length;
+        int[] locals = new int[length];
+        StaticScope scope = getCurrentScope();
+
+        for (int i = 0; i < length; i++) {
+            // TODO: Pass by non-local-varnamed things but make sure consistent with list we get from regexp
+
+            int slot = scope.isDefined(names[i]);
+            if (slot >= 0) {
+                locals[i] = slot;
+            } else {
+                locals[i] = getCurrentScope().addVariableThisScope(names[i]);
+            }
+        }
+
+        return locals;
+    }
+
+    private boolean is7BitASCII(ByteList value) {
+        return StringSupport.codeRangeScan(value.getEncoding(), value) == StringSupport.CR_7BIT;
+    }
+
+    public void setRegexpEncoding(RegexpNode end, ByteList value) {
+        RegexpOptions options = end.getOptions();
+        Encoding optionsEncoding = options.setup19(configuration.getRuntime()) ;
+
+        // Change encoding to one specified by regexp options as long as the string is compatible.
+        if (optionsEncoding != null) {
+            if (optionsEncoding != value.getEncoding() && !is7BitASCII(value)) {
+                compileError(optionsEncoding, value.getEncoding());
+            }
+
+            value.setEncoding(optionsEncoding);
+        } else if (options.isEncodingNone()) {
+            if (value.getEncoding() == RubyYaccLexer.ASCII8BIT_ENCODING && !is7BitASCII(value)) {
+                compileError(optionsEncoding, value.getEncoding());
+            }
+            value.setEncoding(RubyYaccLexer.ASCII8BIT_ENCODING);
+        } else if (lexer.getEncoding() == RubyYaccLexer.USASCII_ENCODING) {
+            if (!is7BitASCII(value)) {
+                value.setEncoding(RubyYaccLexer.USASCII_ENCODING); // This will raise later
+            } else {
+                value.setEncoding(RubyYaccLexer.ASCII8BIT_ENCODING);
+            }
+        }
+    }
+
+
+    // TODO: Put somewhere more consolidated (similiar
+    private char optionsEncodingChar(Encoding optionEncoding) {
+        if (optionEncoding == RubyYaccLexer.USASCII_ENCODING) return 'n';
+        if (optionEncoding == org.jcodings.specific.EUCJPEncoding.INSTANCE) return 'e';
+        if (optionEncoding == org.jcodings.specific.SJISEncoding.INSTANCE) return 's';
+        if (optionEncoding == RubyYaccLexer.UTF8_ENCODING) return 'u';
+
+        return ' ';
+    }
+
+    protected void compileError(Encoding optionEncoding, Encoding encoding) {
+        throw new SyntaxException(PID.REGEXP_ENCODING_MISMATCH, lexer.getPosition(), lexer.getCurrentLine(),
+                "regexp encoding option '" + optionsEncodingChar(optionEncoding) +
+                "' differs from source encoding '" + encoding + "'");
+    }
+
+    @Override
+    public void regexpFragmentCheck(RegexpNode end, ByteList value) {
+        setRegexpEncoding(end, value);
+        RubyRegexp.preprocessCheck(configuration.getRuntime(), value);
+    }
+
+    @Override
+    public Node getMatchNode(Node firstNode, Node secondNode) {
+        if (firstNode instanceof DRegexpNode) {
+            return new Match2Node(firstNode.getPosition(), firstNode, secondNode);
+        } else if (firstNode instanceof RegexpNode) {
+            int[] locals = allocateNamedLocals((RegexpNode) firstNode);
+
+            if (locals.length > 0) {
+                return new Match2CaptureNode(firstNode.getPosition(), firstNode, secondNode, locals);
+            } else {
+                return new Match2Node(firstNode.getPosition(), firstNode, secondNode);
+            }
+        } else if (secondNode instanceof DRegexpNode || secondNode instanceof RegexpNode) {
+            return new Match3Node(firstNode.getPosition(), secondNode, firstNode);
+        }
+
+        return getOperatorCallNode(firstNode, "=~", secondNode);
+    }
+
 }

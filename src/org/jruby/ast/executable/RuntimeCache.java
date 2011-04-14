@@ -2,6 +2,7 @@ package org.jruby.ast.executable;
 
 import java.math.BigInteger;
 import java.util.Arrays;
+import org.jcodings.Encoding;
 import org.jruby.Ruby;
 import org.jruby.RubyClass;
 import org.jruby.RubyClass.VariableAccessor;
@@ -25,6 +26,7 @@ import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.runtime.callsite.CacheEntry;
 import org.jruby.util.ByteList;
+import org.jruby.util.RegexpOptions;
 
 public class RuntimeCache {
 
@@ -100,8 +102,16 @@ public class RuntimeCache {
         return symbol;
     }
 
-    public final RubyString getString(Ruby runtime, int index) {
-        return RubyString.newStringShared(runtime, byteLists[index]);
+    public final RubyString getString(Ruby runtime, int index, int codeRange) {
+        return RubyString.newStringShared(runtime, getByteList(index), codeRange);
+    }
+
+    public final ByteList getByteList(int index) {
+        return byteLists[index];
+    }
+
+    public final Encoding getEncoding(int index) {
+        return encodings[index];
     }
 
     public final RubyFixnum getFixnum(Ruby runtime, int index, int value) {
@@ -120,10 +130,10 @@ public class RuntimeCache {
         return fixnum;
     }
 
-    public final RubyRegexp getRegexp(Ruby runtime, int index, String pattern, int options) {
+    public final RubyRegexp getRegexp(Ruby runtime, int index, ByteList pattern, int options) {
         RubyRegexp regexp = regexps[index];
         if (regexp == null || runtime.getKCode() != regexp.getKCode()) {
-            regexp = RubyRegexp.newRegexp(runtime, pattern, options);
+            regexp = RubyRegexp.newRegexp(runtime, pattern, RegexpOptions.fromEmbeddedOptions(options));
             regexp.setLiteral();
             regexps[index] = regexp;
         }
@@ -138,7 +148,7 @@ public class RuntimeCache {
         RubyRegexp regexp = regexps[index];
         Ruby runtime = pattern.getRuntime();
         if (regexp == null || runtime.getKCode() != regexp.getKCode()) {
-            regexp = RubyRegexp.newRegexp(runtime, pattern.getByteList(), options);
+            regexp = RubyRegexp.newRegexp(runtime, pattern.getByteList(), RegexpOptions.fromEmbeddedOptions(options));
             regexps[index] = regexp;
         }
         return regexp;
@@ -245,6 +255,7 @@ public class RuntimeCache {
     private static final int BLOCKCALLBACK = BLOCKBODY + 1;
     private static final int METHOD = BLOCKCALLBACK + 1;
     private static final int STRING = METHOD + 1;
+    private static final int ENCODING = STRING + 1;
 
     /**
      * Given a packed descriptor of other cache sizes, construct the cache arrays
@@ -292,6 +303,8 @@ public class RuntimeCache {
         if (methodCount > 0) initMethodCache(methodCount);
         int stringCount = getDescriptorValue(descriptor, STRING);
         if (stringCount > 0) initStrings(stringCount);
+        int encodingCount = getDescriptorValue(descriptor, ENCODING);
+        if (encodingCount > 0) initEncodings(encodingCount);
     }
 
     private static int getDescriptorValue(String descriptor, int type) {
@@ -312,6 +325,10 @@ public class RuntimeCache {
 
     public final ByteList[] initStrings(int size) {
         return byteLists = new ByteList[size];
+    }
+
+    public final Encoding[] initEncodings(int size) {
+        return encodings = new Encoding[size];
     }
 
     public final void initFixnums(int size) {
@@ -401,34 +418,12 @@ public class RuntimeCache {
     }
 
     private BlockBody createBlockBody(Object scriptObject, ThreadContext context, int index, String descriptor) throws NumberFormatException {
-        String[] firstSplit = descriptor.split(",");
-        String[] secondSplit;
-        if (firstSplit[2].length() == 0) {
-            secondSplit = new String[0];
-        } else {
-            secondSplit = firstSplit[2].split(";");
-            // FIXME: Big fat hack here, because scope names are expected to be interned strings by the parser
-            for (int i = 0; i < secondSplit.length; i++) {
-                secondSplit[i] = secondSplit[i].intern();
-            }
-        }
-        BlockBody body = RuntimeHelpers.createCompiledBlockBody(context, scriptObject, firstSplit[0], Integer.parseInt(firstSplit[1]), secondSplit, Boolean.valueOf(firstSplit[3]), Integer.parseInt(firstSplit[4]), firstSplit[5], Integer.parseInt(firstSplit[6]), Boolean.valueOf(firstSplit[7]));
+        BlockBody body = RuntimeHelpers.createCompiledBlockBody(context, scriptObject, descriptor);
         return blockBodies[index] = body;
     }
 
     private BlockBody createBlockBody19(Object scriptObject, ThreadContext context, int index, String descriptor) throws NumberFormatException {
-        String[] firstSplit = descriptor.split(",");
-        String[] secondSplit;
-        if (firstSplit[2].length() == 0) {
-            secondSplit = new String[0];
-        } else {
-            secondSplit = firstSplit[2].split(";");
-            // FIXME: Big fat hack here, because scope names are expected to be interned strings by the parser
-            for (int i = 0; i < secondSplit.length; i++) {
-                secondSplit[i] = secondSplit[i].intern();
-            }
-        }
-        BlockBody body = RuntimeHelpers.createCompiledBlockBody19(context, scriptObject, firstSplit[0], Integer.parseInt(firstSplit[1]), secondSplit, Boolean.valueOf(firstSplit[3]), Integer.parseInt(firstSplit[4]), firstSplit[5], Integer.parseInt(firstSplit[6]), Boolean.valueOf(firstSplit[7]));
+        BlockBody body = RuntimeHelpers.createCompiledBlockBody19(context, scriptObject, descriptor);
         return blockBodies[index] = body;
     }
 
@@ -627,6 +622,8 @@ public class RuntimeCache {
     public RubySymbol[] symbols = EMPTY_RUBYSYMBOLS;
     private static final ByteList[] EMPTY_BYTELISTS = {};
     public ByteList[] byteLists = EMPTY_BYTELISTS;
+    private static final Encoding[] EMPTY_ENCODINGS = {};
+    public Encoding[] encodings = EMPTY_ENCODINGS;
     private static final RubyFixnum[] EMPTY_FIXNUMS = {};
     public RubyFixnum[] fixnums = EMPTY_FIXNUMS;
     private static final RubyRegexp[] EMPTY_RUBYREGEXPS = {};

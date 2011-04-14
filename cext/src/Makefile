@@ -35,7 +35,7 @@ endif
 
 LIBCEXT = $(JRUBY_NATIVE_DIR)/$(PLATFORM)/$(PREFIX)$(LIBNAME).$(JNIEXT)
 
-CPU ?= $(shell uname -m | sed -e 's/i[345678]86/i386/')
+CPU ?= $(shell uname -m | sed -e 's/i[345678]86/i386/' | sed -e 's/amd64/x86_64/')
 MODEL = 32 # Default to 32bit compiles
 
 # Try to determine JAVA_HOME if not set
@@ -154,14 +154,14 @@ endif
 
 ifeq ($(OS), darwin)
   PLATFORM = Darwin
-  MACSDK = /Developer/SDKs/MacOSX10.5.sdk
+  MACSDK = $(firstword $(wildcard /Developer/SDKs/MacOSX*.sdk))
   JDK_INCLUDES = -I$(MACSDK)/System/Library/Frameworks/JavaVM.framework/Headers
   ARCHES = ppc
   ifneq ($(findstring $(CPU), i386 x86_64),)
     ARCHES= i386 x86_64
   endif
 
-  CFLAGS += -isysroot $(MACSDK) -DTARGET_RT_MAC_CFM=0
+  CFLAGS += -isysroot $(MACSDK) -DTARGET_RT_MAC_CFM=0 -I/usr/include
   ARCHFLAGS = $(foreach arch, $(ARCHES),-arch $(arch))
   LDFLAGS = $(foreach arch, $(ARCHES),-arch $(arch)) -dynamiclib -framework JavaVM \
 	-Wl,-syslibroot,$(MACSDK) -mmacosx-version-min=10.5
@@ -178,9 +178,12 @@ ifeq ($(OS), linux)
 endif
 
 ifeq ($(OS), solaris)
+  ifeq ($(CPU), i86pc)
+    override CPU = i386
+  endif
   PLATFORM = $(CPU)-SunOS
   CC = gcc
-  CFLAGS += -D__EXTENSIONS__ -std=c99
+  CFLAGS += -D__EXTENSIONS__ 
   LD = /usr/ccs/bin/ld
   SOFLAGS = -shared -static-libgcc -mimpure-text
   LIBS += -ldl
@@ -196,10 +199,18 @@ ifeq ($(OS), aix)
 endif
 
 ifneq ($(findstring bsd, $(OS)),)
-  PLATFORM = $(CPU)-FreeBSD
+  ifneq ($(findstring openbsd, $(OS)),)
+    PLATFORM = $(CPU)-OpenBSD
+  else
+    PLATFORM = $(CPU)-FreeBSD
+  endif
   SOFLAGS = -shared -static-libgcc
   CFLAGS += -pthread
   LDFLAGS += -pthread
+endif
+
+ifneq ($(findstring sun4, $(CPU)),)
+  CPU=sparc
 endif
 
 ifeq ($(CPU), sparcv9)

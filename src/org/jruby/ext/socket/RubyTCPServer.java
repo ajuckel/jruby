@@ -27,7 +27,6 @@
  ***** END LICENSE BLOCK *****/
 package org.jruby.ext.socket;
 
-import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
@@ -43,7 +42,6 @@ import java.util.regex.Pattern;
 import org.jruby.Ruby;
 import org.jruby.RubyClass;
 import org.jruby.RubyFixnum;
-import org.jruby.RubyIO;
 import org.jruby.RubyInteger;
 import org.jruby.RubyNumeric;
 import org.jruby.RubyString;
@@ -216,8 +214,8 @@ public class RubyTCPServer extends RubyTCPSocket {
                 ssc.configureBlocking(false);
                 selector = SelectorFactory.openWithRetryFrom(getRuntime(), SelectorProvider.provider());
 
-                int selected = selector.selectNow();
-                if (selected == 0) {
+                boolean ready = context.getThread().select(this, SelectionKey.OP_ACCEPT, 0);
+                if (!ready) {
                     // no connection immediately accepted, let them try again
                     throw context.getRuntime().newErrnoEAGAINError("Resource temporarily unavailable");
                 } else {

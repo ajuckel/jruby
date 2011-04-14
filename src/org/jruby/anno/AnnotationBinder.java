@@ -117,6 +117,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
 
                     // scan for meta, compat, etc to reduce findbugs complaints about "dead assignments"
                     boolean hasMeta = false;
+                    boolean hasModule = false;
                     boolean hasCompat = false;
                     for (MethodDeclaration md : cd.getMethods()) {
                         JRubyMethod anno = md.getAnnotation(JRubyMethod.class);
@@ -124,13 +125,13 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                             continue;
                         }
                         hasMeta |= anno.meta();
+                        hasModule |= anno.module();
                         hasCompat |= anno.compat() != CompatVersion.BOTH;
                     }
 
                     out.println("        JavaMethod javaMethod;");
                     out.println("        DynamicMethod moduleMethod;");
-                    if (hasMeta) out.println("        RubyClass metaClass = cls.getMetaClass();");
-                    out.println("        RubyModule singletonClass;");
+                    if (hasMeta || hasModule) out.println("        RubyClass singletonClass = cls.getSingletonClass();");
                     if (hasCompat) out.println("        CompatVersion compatVersion = cls.getRuntime().getInstanceConfig().getCompatVersion();");
                     out.println("        Ruby runtime = cls.getRuntime();");
 
@@ -362,7 +363,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                         hasBlock |= pd.getType().toString().equals("org.jruby.runtime.Block");
                     }
 
-                    int actualRequired = calculateActualRequired(md.getParameters().size(), anno.optional(), anno.rest(), isStatic, hasContext, hasBlock);
+                    int actualRequired = calculateActualRequired(md, md.getParameters().size(), anno.optional(), anno.rest(), isStatic, hasContext, hasBlock);
 
                     String annotatedBindingName = CodegenUtils.getAnnotatedBindingClassName(
                             md.getSimpleName(),
@@ -372,7 +373,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                             anno.optional(),
                             false,
                             anno.frame());
-                    String implClass = anno.meta() ? "metaClass" : "cls";
+                    String implClass = anno.meta() ? "singletonClass" : "cls";
 
                     out.println("        javaMethod = new " + annotatedBindingName + "(" + implClass + ", Visibility." + anno.visibility() + ");");
                     out.println("        populateMethod(javaMethod, " +
@@ -404,7 +405,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                         hasBlock |= pd.getType().toString().equals("org.jruby.runtime.Block");
                     }
 
-                    int actualRequired = calculateActualRequired(md.getParameters().size(), anno.optional(), anno.rest(), isStatic, hasContext, hasBlock);
+                    int actualRequired = calculateActualRequired(md, md.getParameters().size(), anno.optional(), anno.rest(), isStatic, hasContext, hasBlock);
 
                     String annotatedBindingName = CodegenUtils.getAnnotatedBindingClassName(
                             md.getSimpleName(),
@@ -414,7 +415,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                             anno.optional(),
                             true,
                             anno.frame());
-                    String implClass = anno.meta() ? "metaClass" : "cls";
+                    String implClass = anno.meta() ? "singletonClass" : "cls";
 
                     out.println("        javaMethod = new " + annotatedBindingName + "(" + implClass + ", Visibility." + anno.visibility() + ");");
                     out.println("        populateMethod(javaMethod, " +
@@ -454,7 +455,7 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                 return qualifiedName;
             }
 
-            private int calculateActualRequired(int paramsLength, int optional, boolean rest, boolean isStatic, boolean hasContext, boolean hasBlock) {
+            private int calculateActualRequired(MethodDeclaration md, int paramsLength, int optional, boolean rest, boolean isStatic, boolean hasContext, boolean hasBlock) {
                 int actualRequired;
                 if (optional == 0 && !rest) {
                     int args = paramsLength;
@@ -495,7 +496,8 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
                     }
 
                     if (actualRequired != 0) {
-                        throw new RuntimeException("Combining specific args with IRubyObject[] is not yet supported");
+                        throw new RuntimeException("Combining specific args with IRubyObject[] is not yet supported: "
+                                + md.getDeclaringType().getQualifiedName() + "." + md.toString());
                     }
                 }
 
@@ -504,64 +506,34 @@ public class AnnotationBinder implements AnnotationProcessorFactory {
 
             public void generateMethodAddCalls(MethodDeclaration md, JRubyMethod jrubyMethod) {
                 if (jrubyMethod.meta()) {
-                    String baseName;
-                    if (jrubyMethod.name().length == 0) {
-                        baseName = md.getSimpleName();
-                        out.println("        metaClass.addMethodAtBootTimeOnly(\"" + baseName + "\", javaMethod);");
-                    } else {
-                        baseName = jrubyMethod.name()[0];
-                        for (String name : jrubyMethod.name()) {
-                            out.println("        metaClass.addMethodAtBootTimeOnly(\"" + name + "\", javaMethod);");
-                        }
-                    }
-
-                    if (jrubyMethod.alias().length > 0) {
-                        for (String alias : jrubyMethod.alias()) {
-                            out.println("        metaClass.defineAlias(\"" + alias + "\", \"" + baseName + "\");");
-                        }
-                    }
+                    defineMethodOnClass("javaMethod", "singletonClass", jrubyMethod, md);
                 } else {
-                    String baseName;
-                    if (jrubyMethod.name().length == 0) {
-                        baseName = md.getSimpleName();
-                        out.println("        cls.addMethodAtBootTimeOnly(\"" + baseName + "\", javaMethod);");
-                    } else {
-                        baseName = jrubyMethod.name()[0];
-                        for (String name : jrubyMethod.name()) {
-                            out.println("        cls.addMethodAtBootTimeOnly(\"" + name + "\", javaMethod);");
-                        }
-                    }
-
-                    if (jrubyMethod.alias().length > 0) {
-                        for (String alias : jrubyMethod.alias()) {
-                            out.println("        cls.defineAlias(\"" + alias + "\", \"" + baseName + "\");");
-                        }
-                    }
-
+                    defineMethodOnClass("javaMethod", "cls", jrubyMethod, md);
                     if (jrubyMethod.module()) {
                         out.println("        moduleMethod = populateModuleMethod(cls, javaMethod);");
-                        out.println("        singletonClass = moduleMethod.getImplementationClass();");
-
-                        //                        RubyModule singletonClass = module.getSingletonClass();
-
-                        if (jrubyMethod.name().length == 0) {
-                            baseName = md.getSimpleName();
-                            out.println("        singletonClass.addMethodAtBootTimeOnly(\"" + baseName + "\", moduleMethod);");
-                        } else {
-                            baseName = jrubyMethod.name()[0];
-                            for (String name : jrubyMethod.name()) {
-                                out.println("        singletonClass.addMethodAtBootTimeOnly(\"" + name + "\", moduleMethod);");
-                            }
-                        }
-
-                        if (jrubyMethod.alias().length > 0) {
-                            for (String alias : jrubyMethod.alias()) {
-                                out.println("        singletonClass.defineAlias(\"" + alias + "\", \"" + baseName + "\");");
-                            }
-                        }
+                        defineMethodOnClass("moduleMethod", "singletonClass", jrubyMethod, md);
                     }
                 }
             //                }
+            }
+
+            private void defineMethodOnClass(String methodVar, String classVar, JRubyMethod jrubyMethod, MethodDeclaration md) {
+                String baseName;
+                if (jrubyMethod.name().length == 0) {
+                    baseName = md.getSimpleName();
+                    out.println("        " + classVar + ".addMethodAtBootTimeOnly(\"" + baseName + "\", " + methodVar + ");");
+                } else {
+                    baseName = jrubyMethod.name()[0];
+                    for (String name : jrubyMethod.name()) {
+                        out.println("        " + classVar + ".addMethodAtBootTimeOnly(\"" + name + "\", " + methodVar + ");");
+                    }
+                }
+
+                if (jrubyMethod.alias().length > 0) {
+                    for (String alias : jrubyMethod.alias()) {
+                        out.println("        " + classVar + ".defineAlias(\"" + alias + "\", \"" + baseName + "\");");
+                    }
+                }
             }
         }
 

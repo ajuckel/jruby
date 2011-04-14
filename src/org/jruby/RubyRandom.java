@@ -28,12 +28,16 @@ package org.jruby;
 import java.util.Random;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
+import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ThreadContext;
 import static org.jruby.runtime.Visibility.PRIVATE;
 import static org.jruby.CompatVersion.*;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.util.ByteList;
+
+import static org.jruby.javasupport.util.RuntimeHelpers.invokedynamic;
+import static org.jruby.runtime.MethodIndex.OP_EQUAL;
 
 /**
  * Implementation of the Random class.
@@ -124,8 +128,15 @@ public class RubyRandom extends RubyObject {
         } else if (arg instanceof RubyRange) { // RANGE ARGUMENT
             RubyRange range = (RubyRange) arg;
             IRubyObject first = range.first();
-            IRubyObject last = range.last();
-            if (range.include_p19(context, last).isTrue()) {
+            IRubyObject last  = range.last();
+            
+            boolean returnFloat = first instanceof RubyFloat || last instanceof RubyFloat;
+            if (returnFloat) {
+                first = first.convertToFloat();
+                last  = last.convertToFloat();
+            }
+
+            if (range.include_p19(context, last).isTrue() && (!returnFloat)) {
                 last = last.callMethod(context, "+", runtime.newFixnum(1));
             }
 
@@ -135,11 +146,18 @@ public class RubyRandom extends RubyObject {
             }
 
             IRubyObject difference = last.callMethod(context, "-", first);
-            int max = (int) RubyNumeric.num2long(difference);
+            if (returnFloat) {
+                double max = (double) RubyNumeric.num2dbl(difference);
+                double rand = random.nextDouble() * ((RubyFloat) difference).getDoubleValue();
+                return RubyFloat.newFloat(runtime, ((RubyFloat) first).getDoubleValue() + rand);
+                
+            } else {
+                int max = (int) RubyNumeric.num2long(difference);
 
-            int rand = random.nextInt(max);
+                int rand = random.nextInt(max);
 
-            return RubyNumeric.num2fix(first.callMethod(context, "+", runtime.newFixnum(rand)));
+                return RubyNumeric.num2fix(first.callMethod(context, "+", runtime.newFixnum(rand)));
+            }
         } else if (arg instanceof RubyFloat) { // FLOAT ARGUMENT
             double max = RubyNumeric.num2dbl(arg);
             if (max <= 0 && raiseArgError) {
@@ -215,7 +233,7 @@ public class RubyRandom extends RubyObject {
             return runtime.getFalse();
         } else {
             RubyRandom r2 = (RubyRandom) obj;
-            return this.seed(context).callMethod(context, "==", r2.seed(context));
+            return invokedynamic(context, this.seed(context), OP_EQUAL, r2.seed(context));
         }
     }
 
@@ -249,6 +267,24 @@ public class RubyRandom extends RubyObject {
         return context.getRuntime().newString(new ByteList(bytes));
     }
 
+    public static double randomReal(ThreadContext context, IRubyObject obj) {
+        Random random = null;
+        if (obj.equals(context.runtime.getRandomClass())) {
+            random = globalRandom;
+        }
+        if (obj instanceof RubyRandom) {
+            random = ((RubyRandom) obj).random;
+        }
+        if (random != null) {
+            return random.nextDouble();
+        }
+        double d = RubyNumeric.num2dbl(RuntimeHelpers.invoke(context, obj, "rand"));
+        if (d < 0.0 || d >= 1.0) {
+            throw context.runtime.newRangeError("random number too big: " + d);
+        }
+        return d;
+    }
+    
     @JRubyMethod(name = "new_seed", meta = true, compat = RUBY1_9)
     public static IRubyObject newSeed(ThreadContext context, IRubyObject recv) {
         Ruby runtime = context.getRuntime();

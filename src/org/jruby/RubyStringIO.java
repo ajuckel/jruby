@@ -38,7 +38,6 @@ import org.jruby.anno.FrameField;
 import org.jruby.anno.JRubyClass;
 import org.jruby.anno.JRubyMethod;
 import org.jruby.java.addons.IOJavaAddons;
-import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.Block;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.ThreadContext;
@@ -161,6 +160,7 @@ public class RubyStringIO extends RubyObject {
     }
 
     @JRubyMethod(visibility = PRIVATE)
+    @Override
     public IRubyObject initialize_copy(IRubyObject other) {
 
         RubyStringIO otherIO = (RubyStringIO) TypeConverter.convertToType(
@@ -357,6 +357,15 @@ public class RubyStringIO extends RubyObject {
         return getRuntime().newFixnum(data.internal.getByteList().get((int)data.pos++) & 0xFF);
     }
 
+    @JRubyMethod(name = "getc", compat = CompatVersion.RUBY1_9)
+    public IRubyObject getc19(ThreadContext context) {
+        checkReadable();
+        if (data.pos >= data.internal.getByteList().length()) {
+            return context.getRuntime().getNil();
+        }
+        return context.getRuntime().newString("" + (char)(data.internal.getByteList().get((int)data.pos++) & 0xFF));
+    }
+
     private IRubyObject internalGets(ThreadContext context, IRubyObject[] args) {
         Ruby runtime = context.getRuntime();
 
@@ -462,6 +471,11 @@ public class RubyStringIO extends RubyObject {
         return getRuntime().getNil();
     }
 
+    @JRubyMethod(name = "path", compat = CompatVersion.RUBY1_9)
+    public IRubyObject path19(ThreadContext context) {
+        throw context.getRuntime().newNoMethodError("", "path", null);
+    }
+
     @JRubyMethod(name = "pid")
     public IRubyObject pid() {
         return getRuntime().getNil();
@@ -496,10 +510,26 @@ public class RubyStringIO extends RubyObject {
             append(context, arg.isNil() ? runtime.newString("nil") : arg);
         }
         IRubyObject sep = runtime.getGlobalVariables().get("$\\");
-        if (!sep.isNil()) {
-            append(context, sep);
+        if (!sep.isNil()) append(context, sep);
+
+        return runtime.getNil();
+    }
+
+    @JRubyMethod(name = "print", rest = true, compat = CompatVersion.RUBY1_9)
+    public IRubyObject print19(ThreadContext context, IRubyObject[] args) {
+        Ruby runtime = context.getRuntime();
+        if (args.length != 0) {
+            for (int i=0,j=args.length;i<j;i++) {
+                append(context, args[i]);
+            }
+        } else {
+            IRubyObject arg = runtime.getGlobalVariables().get("$_");
+            append(context, arg.isNil() ? RubyString.newEmptyString(getRuntime()) : arg);
         }
-        return getRuntime().getNil();
+        IRubyObject sep = runtime.getGlobalVariables().get("$\\");
+        if (!sep.isNil()) append(context, sep);
+
+        return runtime.getNil();
     }
 
     @JRubyMethod(name = "printf", required = 1, rest = true)
@@ -688,9 +718,32 @@ public class RubyStringIO extends RubyObject {
         return originalString != null ? originalString : getRuntime().newString(buf);
     }
 
+    @JRubyMethod(name="read_nonblock", compat = CompatVersion.RUBY1_9, required = 1, optional = 1)
+    public IRubyObject read_nonblock(ThreadContext contet, IRubyObject[] args) {
+        return sysreadCommon(args);
+    }
+
+    /**
+     * readpartial(length, [buffer])
+     *
+     */
+    @JRubyMethod(name ="readpartial", compat = CompatVersion.RUBY1_9, required = 1, optional = 1)
+    public IRubyObject readpartial(ThreadContext context, IRubyObject[] args) {
+        return sysreadCommon(args);
+    }
+
     @JRubyMethod(name = {"readchar", "readbyte"})
     public IRubyObject readchar() {
         IRubyObject c = getc();
+
+        if (c.isNil()) throw getRuntime().newEOFError();
+
+        return c;
+    }
+
+    @JRubyMethod(name = "readchar", compat = CompatVersion.RUBY1_9)
+    public IRubyObject readchar19(ThreadContext context) {
+        IRubyObject c = getc19(context);
 
         if (c.isNil()) throw getRuntime().newEOFError();
 
@@ -801,15 +854,16 @@ public class RubyStringIO extends RubyObject {
 
     @JRubyMethod(name = "sysread", optional = 2)
     public IRubyObject sysread(IRubyObject[] args) {
+        return sysreadCommon(args);
+    }
+    
+
+    private IRubyObject sysreadCommon(IRubyObject[] args) {
         IRubyObject obj = read(args);
 
-        if (isEOF()) {
-            if (obj.isNil()) {
-                throw getRuntime().newEOFError();
-            }
-        }
+        if (isEOF() && obj.isNil()) throw getRuntime().newEOFError();
 
-        return obj;
+        return obj;        
     }
 
     @JRubyMethod(name = "truncate", required = 1)
@@ -836,6 +890,30 @@ public class RubyStringIO extends RubyObject {
 
         int c = RubyNumeric.num2int(arg);
         if (data.pos == 0) return getRuntime().getNil();
+        ungetcCommon(c);
+        return getRuntime().getNil();
+    }
+
+    @JRubyMethod(name = "ungetc", compat = CompatVersion.RUBY1_9)
+    public IRubyObject ungetc19(ThreadContext context, IRubyObject arg) {
+        checkReadable();
+
+        if (!arg.isNil()) {
+            int c;
+            if (arg instanceof RubyFixnum) {
+                c = RubyNumeric.fix2int(arg);
+            } else {
+                RubyString str = arg.convertToString();
+                c = str.getEncoding().mbcToCode(str.getBytes(), 0, 1);
+            }
+
+            ungetcCommon(c);
+        }
+
+        return getRuntime().getNil();
+    }
+
+    private void ungetcCommon(int c) {
         data.internal.modify();
         data.pos--;
 
@@ -846,7 +924,6 @@ public class RubyStringIO extends RubyObject {
         }
 
         bytes.set((int) data.pos, c);
-        return getRuntime().getNil();
     }
 
     @JRubyMethod(name = {"write", "syswrite"}, required = 1)

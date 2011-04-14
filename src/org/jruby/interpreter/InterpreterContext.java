@@ -6,8 +6,10 @@ import org.jruby.runtime.DynamicScope;
 import org.jruby.runtime.Frame;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.RubyException;
 
 import org.jruby.compiler.ir.IRMethod;
+import org.jruby.compiler.ir.operands.Label;
 
 
 /**
@@ -36,8 +38,12 @@ public interface InterpreterContext {
 
     public Object getTemporaryVariable(int offset);
     public Object setTemporaryVariable(int offset, Object value);
+/**
     public Object getLocalVariable(String name);
     public Object setLocalVariable(String name, Object value);
+**/
+    public Object getLocalVariable(int offset);
+    public Object setLocalVariable(int offset, Object value);
     public void   updateRenamedVariablesCount(int n);
     public Object getRenamedVariable(int offset);
     public Object setRenamedVariable(int offset, Object value);
@@ -46,8 +52,8 @@ public interface InterpreterContext {
     public void allocateSharedBindingScope(IRMethod method);
     public DynamicScope getSharedBindingScope();
     public boolean hasAllocatedDynamicScope();
-    public Object getSharedBindingVariable(IRMethod irMethod, String varName);
-    public void setSharedBindingVariable(IRMethod irMethod, String varName, Object value);
+    public Object getSharedBindingVariable(int bindingSlot);
+    public void setSharedBindingVariable(int bindingSlot, Object value);
 
     public Block getBlock();
     public void setBlock(Block block);
@@ -62,4 +68,14 @@ public interface InterpreterContext {
     public Frame getFrame();
 
     public IRubyObject[] getParametersFrom(int argIndex);
+
+    public void setMethodExitLabel(Label l);
+
+    public Label getMethodExitLabel();
+
+    // Set the most recently raised exception
+    public void setException(RubyException e);
+
+    // Get the most recently raised exception
+    public RubyException getException();
 }
